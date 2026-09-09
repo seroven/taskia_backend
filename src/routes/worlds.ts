@@ -235,6 +235,7 @@ Responde SOLO JSON (sin markdown):
 context_summary ≤ 400 chars; incluye "Ejercicio activo: …" si hay práctica abierta.
 Dominio (study_eval.passed=true) solo si phase=reviewing, ≥2 aciertos reales, variación distinta, user_turns≥3.
 Si mastered_already=true → passed=true.
+Si message_source=voice: el niño habló (audio transcrito). Usa ese relato para afinar topic_summary (de qué trata el tema) y context_summary. En speak_to_child, resume en 1 frase lo que entendiste y sigue guiando; no menciones micrófonos ni transcripción.
 `
   if (!allowAiDraw) {
     p += 'draw_ops siempre []. No dibujes en la pizarra.'
@@ -305,48 +306,227 @@ async function missionsForChallenge(
   throw new AppError('Alcance no válido')
 }
 
+async function loadMissionStudyMaterial(missionId: number) {
+  const [sessionRows] = await pool.query<RowDataPacket[]>(
+    `SELECT topic_summary, context_summary
+     FROM study_mission_sessions WHERE mission_id = ? LIMIT 1`,
+    [missionId],
+  )
+  const [msgRows] = await pool.query<RowDataPacket[]>(
+    `SELECT content
+     FROM study_mission_messages
+     WHERE mission_id = ? AND role = 'user'
+     ORDER BY created_at ASC, id ASC
+     LIMIT 40`,
+    [missionId],
+  )
+
+  const userExplanations = msgRows
+    .map((m) => String(m.content ?? '').trim())
+    .filter(Boolean)
+    .map((c) => truncateChars(c, 900))
+
+  return {
+    topic_summary: truncateChars(
+      String(sessionRows[0]?.topic_summary ?? ''),
+      200,
+    ),
+    context_summary: truncateChars(
+      String(sessionRows[0]?.context_summary ?? ''),
+      500,
+    ),
+    user_explanations: userExplanations,
+    studied_text: truncateChars(userExplanations.join('\n---\n'), 3500),
+  }
+}
+
 async function generateQuestionsBatch(
   missions: ReturnType<typeof mapMission>[],
   count: number,
   batchOffset: number,
 ) {
-  const catalog = missions.map((m) => ({
-    id: m.id,
-    title: m.title,
-    description: m.description,
-    uses_board: m.uses_board,
-    course: m.course_name,
-  }))
+  const catalog = []
+  for (const m of missions) {
+    const study = await loadMissionStudyMaterial(m.id)
+    catalog.push({
+      id: m.id,
+      title: m.title,
+      description: m.description,
+      uses_board: m.uses_board,
+      course: m.course_name,
+      topic_summary: study.topic_summary,
+      context_summary: study.context_summary,
+      studied_text: study.studied_text,
+      has_user_content: study.user_explanations.length > 0,
+    })
+  }
 
-  const system = `Generas preguntas de desafío para niños ~10 años. Español latinoamericano.
-NO enseñes: solo preguntas evaluables.
-Responde SOLO un JSON array:
-[{"mission_id":1,"kind":"multiple_choice|short_text|fill_blank|board_prompt","prompt":"...","options":["A","B","C","D"]|null,"answer_key":"...","requires_board":false}]
-Reglas:
-- Si uses_board=true en la misión → kind=board_prompt, requires_board=true, options=null.
-- Si uses_board=false → multiple_choice (options 4), short_text o fill_blank; requires_board=false.
-- answer_key: letra A-D para MCQ, o respuesta breve esperada.
-- Variadas y claras. mission_id debe ser de la lista.`
+  const system = `Generas preguntas de desafío para niños ~10 años. Español latinoamericano neutro.
+NO enseñes: solo preguntas evaluables. Responde SOLO un JSON array (sin markdown).
+
+REGLA DE CONTENIDO (la más importante):
+- Pregunta SOLO sobre hechos, nombres, fechas, ideas o ejemplos que aparezcan en studied_text, topic_summary, context_summary o description de la misión.
+- studied_text = lo que el niño contó o escribió sobre el tema en el estudio. Es la fuente principal.
+- PROHIBIDO usar conocimiento general del tema si no está en esas fuentes (aunque el título diga "Independencia del Perú" u otro tema amplio).
+- Si studied_text está vacío o es muy corto, limita las preguntas a lo poco que sí esté en description/topic_summary/context_summary. No inventes batallas, fechas o personajes extras.
+- Las opciones incorrectas de multiple_choice pueden ser plausibles, pero la respuesta correcta DEBE basarse en el material estudiado.
+
+SUFICIENCIA DEL MATERIAL (obligatorio):
+- Primero evalúa cuántas preguntas DISTINTAS y justas se pueden hacer con el material real (sin repetir la misma idea con otras palabras).
+- "count" es un MÁXIMO pedido, no una meta a rellenar. Si el material solo sostiene 4–8 preguntas, devolvé esas; NUNCA inventes para llegar a 20, 40 u 80.
+- Un tema corto o poco estudiado NO es un examen largo. Prefiere pocas preguntas claras a muchas inventadas.
+- Si ya no hay hechos nuevos, DETENTE y devolvé menos ítems. Un array más corto es correcto y preferible.
+- No reformules la misma pregunta. Cada ítem debe evaluar un hecho o idea distinta del material.
+
+Formato EXACTO de cada ítem:
+{
+  "mission_id": <number de la lista>,
+  "kind": "multiple_choice" | "short_text" | "fill_blank" | "board_prompt",
+  "prompt": "texto de la pregunta",
+  "options": ["texto opción 1","texto opción 2","texto opción 3","texto opción 4"] | null,
+  "answer_key": "A" | "B" | "C" | "D" | "respuesta breve",
+  "requires_board": true | false
+}
+
+Reglas de tipo:
+1) Si uses_board=true → kind="board_prompt", requires_board=true, options=null, answer_key=criterio breve según el material estudiado.
+2) Si uses_board=false → SOLO "multiple_choice", "short_text" o "fill_blank"; requires_board=false.
+3) Si kind="multiple_choice":
+   - options = exactamente 4 strings (sin prefijo "A)" / "B)").
+   - answer_key = solo "A"|"B"|"C"|"D" (A=primera opción).
+   - Nunca options=null ni [].
+4) Si kind="short_text" o "fill_blank": options=null; answer_key=respuesta breve tomada del material.
+5) Devolvé como máximo ${count} preguntas (pueden ser menos). mission_id debe existir en la lista.
+6) Mezcla tipos cuando uses_board=false (incluye varias multiple_choice) SOLO si hay material suficiente.
+7) Si hay poco material, haz pocas preguntas simples sobre ese mismo material; no rellenes con trivia externa.
+
+Ejemplo (solo válido si esos datos están en studied_text):
+{"mission_id":1,"kind":"multiple_choice","prompt":"Según lo que estudiaste, ¿quién llegó desde el sur?","options":["José de San Martín","Simón Bolívar","Francisco Pizarro","Tupac Amaru"],"answer_key":"A","requires_board":false}`
 
   const user = JSON.stringify({
-    count,
+    max_count: count,
     batch_offset: batchOffset,
     missions: catalog,
-    instruction: `Genera exactamente ${count} preguntas nuevas.`,
+    instruction: `Genera HASTA ${count} preguntas nuevas (pueden ser menos). ÚNICAMENTE con base en studied_text / topic_summary / context_summary / description. Si el material no alcanza para ${count} preguntas distintas y justas, devolvé solo las que sí se puedan sostener. No inventes para completar el cupo.`,
   })
 
   const raw = await callGemini({ system, user })
+  console.log('[challenge:generate] raw Gemini response:\n', raw)
   const jsonText = extractJson(raw)
   let value: unknown
   try {
     value = JSON.parse(jsonText)
-  } catch {
+  } catch (err) {
+    console.error(
+      '[challenge:generate] JSON parse failed. extractJson=\n',
+      jsonText,
+      err,
+    )
     throw new AppError('No se pudieron generar las preguntas')
   }
   if (!Array.isArray(value)) {
+    console.error('[challenge:generate] expected array, got:', value)
     throw new AppError('Gemini no devolvió un array de preguntas')
   }
   return value as Array<Record<string, unknown>>
+}
+
+/** Tope duro según riqueza del material: evita exámenes enormes con poco estudio. */
+function estimateMaxQuestionsFromMaterial(
+  missions: Array<{
+    description: string | null
+    topic_summary: string
+    context_summary: string
+    studied_text: string
+  }>,
+  requested: number,
+): number {
+  let chars = 0
+  let withBody = 0
+  for (const m of missions) {
+    const body = [m.studied_text, m.topic_summary, m.context_summary, m.description ?? '']
+      .map((s) => String(s ?? '').trim())
+      .filter(Boolean)
+      .join('\n')
+    if (body.length < 24) continue
+    withBody += 1
+    chars += body.length
+  }
+
+  if (withBody === 0) {
+    // Solo títulos/descripciones muy pobres: pocas preguntas como máximo
+    return Math.min(requested, 3)
+  }
+
+  // ~1 pregunta por ~110 caracteres de material útil, con piso suave por misión
+  const fromChars = Math.max(withBody, Math.floor(chars / 110))
+  const capped = Math.min(requested, fromChars)
+  return Math.max(1, Math.min(requested, capped))
+}
+
+/** mysql2 puede devolver JSON ya parseado; Gemini a veces manda shapes raros. */
+function normalizeOptionsList(raw: unknown): string[] | null {
+  if (raw == null) return null
+
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed || trimmed === 'null') return null
+    try {
+      value = JSON.parse(trimmed)
+    } catch {
+      return null
+    }
+  }
+
+  if (Array.isArray(value)) {
+    const texts = value
+      .map((item) => {
+        if (typeof item === 'string') return item.trim()
+        if (item && typeof item === 'object') {
+          const obj = item as Record<string, unknown>
+          const candidate =
+            obj.text ?? obj.label ?? obj.option ?? obj.value ?? obj.content
+          return typeof candidate === 'string' ? candidate.trim() : ''
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .map((t) => t.replace(/^[A-D][).:\-]\s*/i, '').trim())
+      .filter(Boolean)
+    return texts.length > 0 ? texts : null
+  }
+
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const ordered = ['A', 'B', 'C', 'D', 'a', 'b', 'c', 'd', '1', '2', '3', '4']
+    const fromKeys: string[] = []
+    for (const key of ordered) {
+      const v = obj[key]
+      if (typeof v === 'string' && v.trim()) {
+        fromKeys.push(v.trim().replace(/^[A-D][).:\-]\s*/i, ''))
+      }
+    }
+    if (fromKeys.length >= 2) return fromKeys
+  }
+
+  return null
+}
+
+function normalizeAnswerKey(
+  kind: string,
+  answerKey: string,
+  options: string[] | null,
+) {
+  const raw = answerKey.trim()
+  if (kind !== 'multiple_choice') return raw
+  const letter = /^[A-D]/i.exec(raw)?.[0]?.toUpperCase()
+  if (letter) return letter
+  if (options) {
+    const idx = options.findIndex((o) => o.toLowerCase() === raw.toLowerCase())
+    if (idx >= 0 && idx < 4) return String.fromCharCode(65 + idx)
+  }
+  return raw || 'A'
 }
 
 async function getChallengeDetail(challengeId: number, userId: number) {
@@ -359,10 +539,12 @@ async function getChallengeDetail(challengeId: number, userId: number) {
   )
   if (!rows[0]) throw new AppError('Desafío no encontrado', 404)
   const challenge = mapChallenge(rows[0])
+  const isCompleted = challenge.status === 'completed'
 
   const [qrows] = await pool.query<RowDataPacket[]>(
-    `SELECT q.id, q.mission_id, q.sort_order, q.kind, q.prompt, q.options_json, q.requires_board,
-            a.is_correct
+    `SELECT q.id, q.mission_id, q.sort_order, q.kind, q.prompt, q.options_json,
+            q.answer_key, q.requires_board,
+            a.is_correct, a.user_answer
      FROM study_challenge_questions q
      LEFT JOIN study_challenge_answers a ON a.question_id = q.id
      WHERE q.challenge_id = ?
@@ -374,28 +556,36 @@ async function getChallengeDetail(challengeId: number, userId: number) {
   const questions = qrows.map((q, i) => {
     const answered = q.is_correct != null
     if (answered) currentIndex = i + 1
-    let options: string[] | null = null
-    if (q.options_json) {
-      try {
-        const parsed = JSON.parse(q.options_json as string)
-        if (Array.isArray(parsed)) {
-          options = parsed.filter((x): x is string => typeof x === 'string')
-        }
-      } catch {
-        options = null
-      }
+    let options = normalizeOptionsList(q.options_json)
+    const kind = q.kind as string
+    if (kind === 'multiple_choice' && (!options || options.length < 2)) {
+      console.warn(
+        '[challenge:detail] MCQ without usable options',
+        Number(q.id),
+        q.options_json,
+      )
+      options = null
     }
-    return {
+    const answerKey = String(q.answer_key ?? '')
+    const base = {
       id: Number(q.id),
       mission_id: q.mission_id == null ? null : Number(q.mission_id),
       sort_order: Number(q.sort_order),
-      kind: q.kind as string,
+      kind,
       prompt: q.prompt as string,
       options,
       requires_board: Number(q.requires_board) !== 0,
       answered,
       is_correct: q.is_correct == null ? null : Number(q.is_correct) !== 0,
+      user_answer: null as string | null,
+      correct_answer: null as string | null,
     }
+    if (isCompleted) {
+      base.user_answer =
+        q.user_answer == null ? null : String(q.user_answer)
+      base.correct_answer = formatCorrectAnswer(kind, answerKey, options)
+    }
+    return base
   })
 
   if (currentIndex >= questions.length) {
@@ -406,6 +596,85 @@ async function getChallengeDetail(challengeId: number, userId: number) {
   }
 
   return { challenge, questions, current_index: currentIndex }
+}
+
+function formatCorrectAnswer(
+  kind: string,
+  answerKey: string,
+  options: string[] | null,
+) {
+  const key = answerKey.trim()
+  if (kind === 'multiple_choice' && options && options.length > 0) {
+    const letter = /^[A-D]/i.exec(key)?.[0]?.toUpperCase()
+    if (letter) {
+      const idx = letter.charCodeAt(0) - 65
+      const text = options[idx]
+      if (text) return `${letter}. ${text}`
+      return letter
+    }
+  }
+  return key || '—'
+}
+
+function gradeMultipleChoice(answerText: string, answerKey: string) {
+  const normalized = answerText.trim().toUpperCase()
+  const key = answerKey.trim().toUpperCase()
+  const keyLetter = /^[A-D](?=$|[\s).:-])/.exec(key)?.[0]
+  const answerLetter = /^[A-D](?=$|[\s).:-])/.exec(normalized)?.[0]
+  return Boolean(
+    normalized &&
+      key &&
+      (normalized === key ||
+        (keyLetter != null && answerLetter === keyLetter)),
+  )
+}
+
+async function gradeOpenAnswersBatch(
+  items: Array<{
+    question_id: number
+    prompt: string
+    answer_key: string
+    child_answer: string
+    requires_board: boolean
+    board_json_snip: string
+  }>,
+): Promise<Map<number, boolean>> {
+  const results = new Map<number, boolean>()
+  if (items.length === 0) return results
+
+  const raw = await callGemini({
+    system: `Juzgas si las respuestas del niño son correctas según answer_key.
+NO des pistas ni enseñes. Sé razonable con variaciones de redacción.
+Responde SOLO un JSON array:
+[{"question_id":1,"correct":true|false}]
+Debes incluir exactamente un objeto por cada pregunta recibida.`,
+    user: JSON.stringify({ items }),
+  })
+  console.log('[challenge:grade-batch] raw Gemini response:\n', raw)
+
+  let value: unknown
+  try {
+    value = JSON.parse(extractJson(raw))
+  } catch {
+    console.error('[challenge:grade-batch] parse failed', raw)
+    value = []
+  }
+
+  if (Array.isArray(value)) {
+    for (const row of value) {
+      if (!row || typeof row !== 'object') continue
+      const obj = row as Record<string, unknown>
+      const id = Number(obj.question_id)
+      if (!Number.isFinite(id)) continue
+      results.set(id, Boolean(obj.correct))
+    }
+  }
+
+  // Si Gemini omitió alguna, marcar false (no quemar otro request)
+  for (const item of items) {
+    if (!results.has(item.question_id)) results.set(item.question_id, false)
+  }
+  return results
 }
 
 router.use(requireAuth)
@@ -541,6 +810,7 @@ router.post(
 
     const allowAiDraw =
       Boolean(req.body.allow_ai_draw) && mission.uses_board
+    const fromVoice = Boolean(req.body.from_voice)
     const context = await loadMissionContext(missionId)
     const userMsg = await insertMissionMessage(missionId, 'user', message)
     context.messages.push(userMsg)
@@ -559,12 +829,19 @@ router.post(
         : null
     const boardHas = Boolean(boardDescription?.trim())
 
+    let instruction = allowAiDraw
+      ? 'Responde breve. Enseña el tema. Conserva ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
+      : 'Responde breve. Enseña el tema. Conserva ejercicio activo. Evalúa study_eval.'
+    if (fromVoice) {
+      instruction +=
+        ' El mensaje viene de voz (transcrito): prioriza afinar topic_summary y context_summary con lo que explicó el niño.'
+    }
+
     const payload = JSON.stringify({
-      instruction: allowAiDraw
-        ? 'Responde breve. Enseña el tema. Conserva ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
-        : 'Responde breve. Enseña el tema. Conserva ejercicio activo. Evalúa study_eval.',
+      instruction,
       user_turns: userTurns,
       mastered_already: mission.status === 'mastered',
+      message_source: fromVoice ? 'voice' : 'text',
       mission: {
         title: truncateChars(mission.title, 120),
         description: truncateChars(mission.description ?? '', 220),
@@ -581,7 +858,7 @@ router.post(
       ...(boardHas
         ? { board_drawing: truncateChars(boardDescription ?? '', 500) }
         : {}),
-      child_message: truncateChars(message, 800),
+      child_message: truncateChars(message, fromVoice ? 4000 : 800),
     })
 
     const raw = await callGemini({
@@ -699,6 +976,13 @@ router.post(
       throw new AppError('Dificultad no válida')
     }
 
+    // No acumular intentos a medias en el historial: limpia los incompletos previos
+    await pool.query(
+      `DELETE FROM study_challenges
+       WHERE user_id = ? AND status = 'in_progress'`,
+      [userId],
+    )
+
     const questionCount = await presetCount(scope, difficulty)
     const missions = await missionsForChallenge(
       userId,
@@ -707,6 +991,26 @@ router.post(
       missionId,
       courseId,
     )
+
+    const materialSnapshots = []
+    for (const m of missions) {
+      const study = await loadMissionStudyMaterial(m.id)
+      materialSnapshots.push({
+        description: m.description,
+        topic_summary: study.topic_summary,
+        context_summary: study.context_summary,
+        studied_text: study.studied_text,
+      })
+    }
+    const total = estimateMaxQuestionsFromMaterial(
+      materialSnapshots,
+      questionCount,
+    )
+    if (total < questionCount) {
+      console.log(
+        `[challenge:start] capped questions ${questionCount} → ${total} based on study material`,
+      )
+    }
 
     const [result] = await pool.query<ResultSetHeader>(
       `INSERT INTO study_challenges
@@ -719,12 +1023,11 @@ router.post(
         missionId,
         courseId,
         difficulty,
-        questionCount,
+        total,
       ],
     )
     const challengeId = result.insertId
 
-    const total = questionCount
     let generated: Array<Record<string, unknown>> = []
     try {
       if (total <= 15) {
@@ -735,6 +1038,8 @@ router.post(
           const batch = Math.min(10, total - offset)
           const part = await generateQuestionsBatch(missions, batch, offset)
           generated.push(...part)
+          // El modelo devolvió menos: el material ya no alcanza
+          if (part.length < batch) break
           offset += batch
         }
       }
@@ -767,15 +1072,41 @@ router.post(
       } else {
         requiresBoard = false
         if (kind === 'board_prompt') kind = 'multiple_choice'
+        if (
+          !['multiple_choice', 'short_text', 'fill_blank'].includes(kind)
+        ) {
+          kind = 'multiple_choice'
+        }
       }
 
       const prompt =
         typeof item.prompt === 'string' ? item.prompt : '¿Listo?'
-      const answerKey =
-        typeof item.answer_key === 'string' ? item.answer_key : ''
-      const optionsJson = JSON.stringify(
-        item.options === undefined ? null : item.options,
+      let options = normalizeOptionsList(item.options)
+      if (kind === 'multiple_choice') {
+        if (!options || options.length < 2) {
+          console.warn(
+            '[challenge:start] MCQ missing options; falling back to short_text. item=',
+            JSON.stringify(item),
+          )
+          kind = 'short_text'
+          options = null
+        } else if (options.length > 4) {
+          options = options.slice(0, 4)
+        } else {
+          while (options.length < 4) {
+            options.push(`Opción ${String.fromCharCode(65 + options.length)}`)
+          }
+        }
+      } else {
+        options = null
+      }
+
+      const answerKey = normalizeAnswerKey(
+        kind,
+        typeof item.answer_key === 'string' ? item.answer_key : '',
+        options,
       )
+      const optionsJson = options == null ? null : JSON.stringify(options)
 
       await pool.query(
         `INSERT INTO study_challenge_questions
@@ -799,7 +1130,9 @@ router.post(
       await pool.query('DELETE FROM study_challenges WHERE id = ?', [
         challengeId,
       ])
-      throw new AppError('No se generaron preguntas. Probá de nuevo.')
+      throw new AppError(
+        'Todavía no hay suficiente material estudiado para armar un desafío. Seguí estudiando un poquito más e intentá de nuevo.',
+      )
     }
 
     await pool.query(
@@ -820,131 +1153,159 @@ router.get(
   }),
 )
 
-router.post(
-  '/challenges/questions/:questionId/answer',
+/** Descarta un desafío incompleto (no entra al historial). */
+router.delete(
+  '/challenges/:challengeId',
   asyncHandler(async (req, res) => {
     const userId = req.user!.id
-    const questionId = Number(req.params.questionId)
+    const challengeId = Number(req.params.challengeId)
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, status FROM study_challenges
+       WHERE id = ? AND user_id = ? LIMIT 1`,
+      [challengeId, userId],
+    )
+    if (!rows[0]) throw new AppError('Desafío no encontrado', 404)
+
+    if (rows[0].status === 'completed') {
+      throw new AppError('No se puede descartar un desafío ya completado')
+    }
+
+    await pool.query('DELETE FROM study_challenges WHERE id = ? AND user_id = ?', [
+      challengeId,
+      userId,
+    ])
+    res.json({ ok: true })
+  }),
+)
+
+router.post(
+  '/challenges/:challengeId/complete',
+  asyncHandler(async (req, res) => {
+    const userId = req.user!.id
+    const challengeId = Number(req.params.challengeId)
+
+    const [crows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, status FROM study_challenges
+       WHERE id = ? AND user_id = ? LIMIT 1`,
+      [challengeId, userId],
+    )
+    if (!crows[0]) throw new AppError('Desafío no encontrado', 404)
+    if (crows[0].status === 'completed') {
+      res.json(await getChallengeDetail(challengeId, userId))
+      return
+    }
+
+    const answersRaw = Array.isArray(req.body.answers) ? req.body.answers : []
+    if (answersRaw.length === 0) {
+      throw new AppError('Faltan las respuestas del desafío')
+    }
+
+    const answerMap = new Map<
+      number,
+      { user_answer: string; board_json: unknown }
+    >()
+    for (const row of answersRaw) {
+      if (!row || typeof row !== 'object') continue
+      const obj = row as Record<string, unknown>
+      const qid = Number(obj.question_id)
+      if (!Number.isFinite(qid)) continue
+      answerMap.set(qid, {
+        user_answer:
+          typeof obj.user_answer === 'string' ? obj.user_answer : '',
+        board_json: obj.board_json ?? null,
+      })
+    }
 
     const [qrows] = await pool.query<RowDataPacket[]>(
-      `SELECT q.id, q.challenge_id, q.kind, q.prompt, q.answer_key, q.requires_board
-       FROM study_challenge_questions q
-       INNER JOIN study_challenges c ON c.id = q.challenge_id
-       WHERE q.id = ? AND c.user_id = ? LIMIT 1`,
-      [questionId, userId],
-    )
-    if (!qrows[0]) throw new AppError('Pregunta no encontrada', 404)
-
-    const challengeId = Number(qrows[0].challenge_id)
-    const kind = qrows[0].kind as string
-    const prompt = qrows[0].prompt as string
-    const answerKey = qrows[0].answer_key as string
-    const requiresBoard = Number(qrows[0].requires_board) !== 0
-
-    const [alreadyRows] = await pool.query<RowDataPacket[]>(
-      'SELECT COUNT(*) AS c FROM study_challenge_answers WHERE question_id = ?',
-      [questionId],
-    )
-    if (Number(alreadyRows[0]?.c) > 0) {
-      throw new AppError('Esta pregunta ya fue respondida')
-    }
-
-    const answerText =
-      typeof req.body.user_answer === 'string' ? req.body.user_answer : ''
-    const boardJson = req.body.board_json ?? null
-
-    let isCorrect = false
-    if (kind === 'multiple_choice') {
-      const normalized = answerText.trim().toUpperCase()
-      const key = answerKey.trim().toUpperCase()
-      const keyLetter = /^[A-D](?=$|[\s).:-])/.exec(key)?.[0]
-      const answerLetter = /^[A-D](?=$|[\s).:-])/.exec(normalized)?.[0]
-      isCorrect = Boolean(
-        normalized &&
-          key &&
-          (normalized === key ||
-            (keyLetter != null && answerLetter === keyLetter)),
-      )
-    } else {
-      const boardSnip = boardJson
-        ? truncateChars(JSON.stringify(boardJson), 800)
-        : ''
-      const gradeUser = JSON.stringify({
-        prompt,
-        answer_key: answerKey,
-        child_answer: truncateChars(answerText, 800),
-        board_json_snip: boardSnip,
-        requires_board: requiresBoard,
-      })
-      const raw = await callGemini({
-        system:
-          'Juzgas si la respuesta del niño es correcta. NO des pistas ni enseñes.\nResponde SOLO JSON: {"correct":true|false,"evidence":"breve"}',
-        user: gradeUser,
-      })
-      let value: Record<string, unknown> = {}
-      try {
-        value = JSON.parse(extractJson(raw)) as Record<string, unknown>
-      } catch {
-        value = {}
-      }
-      isCorrect = Boolean(value.correct)
-    }
-
-    const boardRaw =
-      boardJson != null ? JSON.stringify(boardJson) : null
-
-    await pool.query(
-      `INSERT INTO study_challenge_answers (question_id, user_answer, board_json, is_correct)
-       VALUES (?, ?, ?, ?)`,
-      [questionId, answerText, boardRaw, isCorrect ? 1 : 0],
-    )
-
-    const [totalRows] = await pool.query<RowDataPacket[]>(
-      'SELECT COUNT(*) AS c FROM study_challenge_questions WHERE challenge_id = ?',
+      `SELECT id, kind, prompt, options_json, answer_key, requires_board
+       FROM study_challenge_questions
+       WHERE challenge_id = ?
+       ORDER BY sort_order ASC, id ASC`,
       [challengeId],
     )
-    const total = Number(totalRows[0]?.c ?? 0)
+    if (qrows.length === 0) throw new AppError('El desafío no tiene preguntas')
 
-    const [answeredRows] = await pool.query<RowDataPacket[]>(
-      `SELECT COUNT(*) AS c
-       FROM study_challenge_answers a
+    for (const q of qrows) {
+      if (!answerMap.has(Number(q.id))) {
+        throw new AppError('Debes responder todas las preguntas antes de terminar')
+      }
+    }
+
+    const openItems: Array<{
+      question_id: number
+      prompt: string
+      answer_key: string
+      child_answer: string
+      requires_board: boolean
+      board_json_snip: string
+    }> = []
+    const graded = new Map<number, boolean>()
+
+    for (const q of qrows) {
+      const qid = Number(q.id)
+      const kind = q.kind as string
+      const answerKey = String(q.answer_key ?? '')
+      const submitted = answerMap.get(qid)!
+      const answerText = submitted.user_answer
+      const requiresBoard = Number(q.requires_board) !== 0
+
+      if (kind === 'multiple_choice') {
+        graded.set(qid, gradeMultipleChoice(answerText, answerKey))
+      } else {
+        const boardSnip = submitted.board_json
+          ? truncateChars(JSON.stringify(submitted.board_json), 500)
+          : ''
+        openItems.push({
+          question_id: qid,
+          prompt: String(q.prompt ?? ''),
+          answer_key: answerKey,
+          child_answer: truncateChars(answerText, 800),
+          requires_board: requiresBoard,
+          board_json_snip: boardSnip,
+        })
+      }
+    }
+
+    const openGrades = await gradeOpenAnswersBatch(openItems)
+    for (const [qid, correct] of openGrades) graded.set(qid, correct)
+
+    // Limpia respuestas previas (por si reintento) y guarda todo de una vez
+    await pool.query(
+      `DELETE a FROM study_challenge_answers a
        INNER JOIN study_challenge_questions q ON q.id = a.question_id
        WHERE q.challenge_id = ?`,
       [challengeId],
     )
-    const answered = Number(answeredRows[0]?.c ?? 0)
 
-    const completed = answered >= total && total > 0
-    let score: number | null = null
-    let nextIndex: number | null = null
-
-    if (completed) {
-      const [correctRows] = await pool.query<RowDataPacket[]>(
-        `SELECT COUNT(*) AS c
-         FROM study_challenge_answers a
-         INNER JOIN study_challenge_questions q ON q.id = a.question_id
-         WHERE q.challenge_id = ? AND a.is_correct = 1`,
-        [challengeId],
-      )
-      const correct = Number(correctRows[0]?.c ?? 0)
-      score = Math.round((correct / total) * 100)
-      const completedAt = formatMysqlDateTime(new Date()) ?? ''
+    let correctCount = 0
+    for (const q of qrows) {
+      const qid = Number(q.id)
+      const submitted = answerMap.get(qid)!
+      const isCorrect = Boolean(graded.get(qid))
+      if (isCorrect) correctCount += 1
+      const boardRaw =
+        submitted.board_json != null
+          ? JSON.stringify(submitted.board_json)
+          : null
       await pool.query(
-        `UPDATE study_challenges
-         SET status = 'completed', score = ?, completed_at = ?
-         WHERE id = ?`,
-        [score, completedAt, challengeId],
+        `INSERT INTO study_challenge_answers (question_id, user_answer, board_json, is_correct)
+         VALUES (?, ?, ?, ?)`,
+        [qid, submitted.user_answer, boardRaw, isCorrect ? 1 : 0],
       )
-    } else {
-      nextIndex = answered
     }
 
-    res.json({
-      is_correct: isCorrect,
-      completed,
-      score,
-      next_index: nextIndex,
-    })
+    const total = qrows.length
+    const score = Math.round((correctCount / total) * 100)
+    const completedAt = formatMysqlDateTime(new Date()) ?? ''
+    await pool.query(
+      `UPDATE study_challenges
+       SET status = 'completed', score = ?, completed_at = ?
+       WHERE id = ?`,
+      [score, completedAt, challengeId],
+    )
+
+    res.json(await getChallengeDetail(challengeId, userId))
   }),
 )
 
@@ -1235,7 +1596,7 @@ router.get(
       SELECT id, user_id, world_id, scope, mission_id, course_id, difficulty,
              question_count, status, score, started_at, completed_at
       FROM study_challenges
-      WHERE world_id = ? AND user_id = ?
+      WHERE world_id = ? AND user_id = ? AND status = 'completed'
     `
     const params: unknown[] = [worldId, userId]
 
@@ -1246,7 +1607,7 @@ router.get(
       sql += ' AND (course_id = ? OR (scope = \'course\' AND course_id = ?))'
       params.push(courseId, courseId)
     }
-    sql += ' ORDER BY started_at DESC, id DESC LIMIT 50'
+    sql += ' ORDER BY completed_at DESC, id DESC LIMIT 50'
 
     const [rows] = await pool.query<RowDataPacket[]>(sql, params)
     res.json(rows.map(mapChallenge))

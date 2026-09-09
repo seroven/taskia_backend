@@ -3,7 +3,7 @@ import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { pool } from '../db/pool.js'
 import { requireAuth } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
-import { callGemini } from '../services/gemini.js'
+import { callGemini, callGeminiTranscribe } from '../services/gemini.js'
 import {
   AppError,
   extractJson,
@@ -71,6 +71,7 @@ Dominio (study_eval): passed=true SOLO si TODOS se cumplen (si falta uno → pas
 Por defecto passed=false. Sé estricto: conversaciones cortas o respuestas vagas NO son dominio.
 Si study_passed_already=true → study_eval.passed=true y evidence corta "ya aprobado".
 Si passed=true, celebra en speak_to_child y di que ya puede mover la tarea a Terminado.
+Si message_source=voice: el niño habló (audio transcrito). Usa ese relato para afinar topic_summary (de qué trata el tema, ≤120 chars) y context_summary. En speak_to_child, resume en 1 frase lo que entendiste y sigue guiando; no digas que “transcribiste” ni hables de micrófonos.
 `
   if (!allowAiDraw) {
     p += 'draw_ops siempre []. No dibujes en la pizarra.'
@@ -235,6 +236,30 @@ function ensureActiveExercise(
 
 router.use(requireAuth)
 
+const MAX_VOICE_SECONDS = 90
+
+router.post(
+  '/transcribe',
+  asyncHandler(async (req, res) => {
+    const audioBase64 = String(req.body.audio_base64 ?? '').trim()
+    const mimeType = String(req.body.mime_type ?? 'audio/webm').trim()
+    const durationSeconds = Number(req.body.duration_seconds)
+
+    if (!audioBase64) throw new AppError('Falta el audio')
+    if (Number.isFinite(durationSeconds) && durationSeconds > MAX_VOICE_SECONDS) {
+      throw new AppError('El audio supera el máximo de 90 segundos')
+    }
+
+    const result = await callGeminiTranscribe({
+      audioBase64,
+      mimeType,
+      durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : undefined,
+    })
+
+    res.json(result)
+  }),
+)
+
 router.get(
   '/:taskId',
   asyncHandler(async (req, res) => {
@@ -302,6 +327,7 @@ router.post(
     const boardImageBase64 = task.uses_board
       ? ((req.body.board_image_base64 ?? req.body.boardImageBase64) as string | null)
       : null
+    const fromVoice = Boolean(req.body.from_voice ?? req.body.fromVoice)
 
     const context = await loadContext(taskId)
     const userMemory = await loadUserMemory(userId)
@@ -316,19 +342,24 @@ router.post(
         ?.content ?? ''
     const boardHas = Boolean(boardDescription?.trim())
 
-    const instruction = allowAiDraw
+    let instruction = allowAiDraw
       ? boardHas
         ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes.'
         : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
       : boardHas
         ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo. Evalúa study_eval.'
         : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo. Ignora pizarra. Evalúa study_eval.'
+    if (fromVoice) {
+      instruction +=
+        ' El mensaje viene de voz (transcrito): prioriza afinar topic_summary y context_summary con lo que explicó el niño.'
+    }
 
     const payload = {
       instruction,
       update_user_memory: updateUserMemory,
       user_turns: userTurns,
       study_passed_already: task.study_passed,
+      message_source: fromVoice ? 'voice' : 'text',
       task: {
         title: truncateChars(task.title, 120),
         description: truncateChars(task.description ?? '', 220),
@@ -343,7 +374,7 @@ router.post(
       user_memory_summary: truncateChars(userMemory, MAX_MEMORY),
       hints_level: context.hints_level,
       board_has_drawing: boardHas,
-      child_message: truncateChars(message, 800),
+      child_message: truncateChars(message, fromVoice ? 4000 : 800),
       ...(allowAiDraw ? { allow_ai_draw: true } : {}),
       ...(boardHas
         ? { board_drawing: truncateChars(boardDescription ?? '', MAX_BOARD) }
