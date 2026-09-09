@@ -1,0 +1,43 @@
+{
+  "name": "taskia_backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env.development src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:dev": "tsx --env-file=.env.development src/index.ts",
+    "start:qa": "tsx --env-file=.env.qa src/index.ts",
+    "start:pd": "tsx --env-file=.env.production src/index.ts",
+    "build:qa": "tsc",
+    "build:pd": "tsc",
+    "db:setup": "node --env-file=.env.development db/migrate.mjs --setup",
+    "db:migrate": "node --env-file=.env.development db/migrate.mjs",
+    "db:setup:qa": "node --env-file=.env.qa db/migrate.mjs --setup",
+    "db:migrate:qa": "node --env-file=.env.qa db/migrate.mjs",
+    "db:setup:pd": "node --env-file=.env.production db/migrate.mjs --setup",
+    "db:migrate:pd": "node --env-file=.env.production db/migrate.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.14.1",
+    "zod": "^3.25.28"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cookie-parser": "^1.4.8",
+    "@types/cors": "^2.8.18",
+    "@types/express": "^5.0.2",
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.15.21",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

@@ -1,0 +1,461 @@
+import { Router } from 'express'
+import type { ResultSetHeader, RowDataPacket } from 'mysql2'
+import { pool } from '../db/pool.js'
+import { requireAuth } from '../middleware/auth.js'
+import { asyncHandler } from '../middleware/error.js'
+import { callGemini } from '../services/gemini.js'
+import {
+  AppError,
+  extractJson,
+  formatMysqlDateTime,
+  truncateChars,
+} from '../utils/helpers.js'
+import { fetchTask } from './tasks.js'
+
+const router = Router()
+const MAX_CONTEXT = 400
+const MAX_MEMORY = 600
+const MAX_SPEAK = 450
+const MAX_BOARD = 500
+const MAX_LAST_TUTOR = 320
+
+function emptyBoard() {
+  return {
+    type: 'excalidraw',
+    version: 2,
+    source: 'taskia',
+    elements: [],
+    appState: { viewBackgroundColor: '#ffffff' },
+    files: {},
+  }
+}
+
+function canOpenStudy(task: { status: string; difficulty_code: string }) {
+  return (
+    task.status === 'studying' ||
+    (task.status === 'done' && task.difficulty_code === 'high')
+  )
+}
+
+/** Instrucciones de pizarra (mismo contrato que taskia_desktop/src-tauri/src/study.rs). */
+const DRAW_OPS_PROMPT = `Pizarra de salida: allow_ai_draw=true. Si el niño pide ejercicio nuevo, practica, o conviene visualizar:
+1) Empieza con {"op":"clear_board"} (la app borra toda la pizarra y centra tu dibujo grande).
+2) Dibuja con 3–8 ops. Preferí stamps con scale≈2; luego shape/text con labels.
+3) No dejes números/figuras solo en speak_to_child: deben ir en draw_ops.
+4) Coordenadas relativas libres (la app re-centra). Labels claros (base, altura, lados).
+Stamps: right_triangle, circle, square, number_line, arrow.
+Shapes: rectangle|ellipse|triangle|line|arrow|text (x,y,w,h,label?,color?).
+Ejemplo (triángulo base 8 altura 4):
+[{"op":"clear_board"},{"op":"stamp","id":"right_triangle","x":0,"y":0,"scale":2},{"op":"shape","type":"text","x":110,"y":175,"label":"8"},{"op":"shape","type":"text","x":-30,"y":70,"label":"4"}]
+`
+
+function tutorSystemPrompt(allowAiDraw: boolean) {
+  let p = `Tutor amable para niño ~10 años. Español latinoamericano, claro y breve.
+No des la solución completa: guía con preguntas/pistas. Prioriza la tarea actual.
+Recibes context_summary (esta tarea), last_tutor_message (tu burbuja anterior) y user_memory_summary. No el chat entero.
+Mantén coherencia con el ejercicio abierto: si last_tutor_message o context_summary citan un número/ejercicio, NO preguntes de qué número hablan.
+Pizarra de entrada: si board_has_drawing=false, ignora lo que haya dibujado el niño.
+Responde SOLO JSON (sin markdown):
+{"phase":"understanding|practicing|reviewing","speak_to_child":"...","ask_questions":[],"topic_summary":"...","context_summary":"...","user_memory_summary":"...","exercise":null,"draw_ops":[],"hints_level":0,"study_eval":{"passed":false,"evidence":""}}
+context_summary ≤ 400 chars. Debe incluir SIEMPRE, si hay ejercicio abierto: "Ejercicio activo: …" con el número/datos exactos; no lo borres hasta resolverlo o cambiarlo. Resume aciertos del niño.
+user_memory_summary ≤ 600 chars (si update_user_memory=false, repite el recibido).
+exercise: usa el objeto cuando planteas un ejercicio nuevo (también en reviewing); si sigues el mismo, puedes dejar null pero conserva "Ejercicio activo" en context_summary.
+Dominio (study_eval): passed=true SOLO si TODOS se cumplen (si falta uno → passed=false):
+1) phase=reviewing (nunca en understanding ni practicing)
+2) user_turns ≥ 5 (si user_turns<5 → passed=false SIEMPRE)
+3) ≥2 aciertos reales del niño en ejercicios/variaciones distintos (números o casos distintos)
+4) al menos una variación distinta al ejemplo inicial planteado
+5) el niño explicó en corto el procedimiento O aplicó el concepto con números nuevos (no basta “sí/ok/ya/listo”)
+6) no regalaste la solución completa en esos turnos
+7) evidence debe citar en 1 frase qué demostró el niño (si no puedes citarlo → passed=false)
+Por defecto passed=false. Sé estricto: conversaciones cortas o respuestas vagas NO son dominio.
+Si study_passed_already=true → study_eval.passed=true y evidence corta "ya aprobado".
+Si passed=true, celebra en speak_to_child y di que ya puede mover la tarea a Terminado.
+`
+  if (!allowAiDraw) {
+    p += 'draw_ops siempre []. No dibujes en la pizarra.'
+  } else {
+    p += DRAW_OPS_PROMPT
+  }
+  return p
+}
+
+function normalizeDrawOps(raw: unknown): unknown[] {
+  if (Array.isArray(raw)) return raw
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+async function ensureSession(taskId: number) {
+  await pool.query(
+    `INSERT INTO study_sessions (task_id, tutor_phase, topic_summary, context_summary, hints_level)
+     VALUES (?, 'understanding', '', '', 0)
+     ON DUPLICATE KEY UPDATE task_id = task_id`,
+    [taskId],
+  )
+}
+
+async function loadContext(taskId: number) {
+  await ensureSession(taskId)
+  const [sess] = await pool.query<RowDataPacket[]>(
+    `SELECT tutor_phase, topic_summary, context_summary, hints_level, updated_at
+     FROM study_sessions WHERE task_id = ?`,
+    [taskId],
+  )
+  const s = sess[0]
+  const [msgs] = await pool.query<RowDataPacket[]>(
+    `SELECT role, content, created_at FROM study_messages
+     WHERE task_id = ? ORDER BY created_at ASC, id ASC`,
+    [taskId],
+  )
+  return {
+    task_id: taskId,
+    updated_at: formatMysqlDateTime(s.updated_at as Date) ?? '',
+    tutor_phase: s.tutor_phase as string,
+    topic_summary: s.topic_summary as string,
+    context_summary: s.context_summary as string,
+    hints_level: Number(s.hints_level),
+    messages: msgs.map((m) => ({
+      role: m.role as string,
+      content: m.content as string,
+      created_at: formatMysqlDateTime(m.created_at as Date) ?? '',
+    })),
+  }
+}
+
+async function loadBoard(taskId: number) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    'SELECT board_json FROM study_boards WHERE task_id = ?',
+    [taskId],
+  )
+  if (rows[0]?.board_json) {
+    try {
+      return JSON.parse(rows[0].board_json as string)
+    } catch {
+      /* fallthrough */
+    }
+  }
+  const board = emptyBoard()
+  await saveBoard(taskId, board)
+  return board
+}
+
+async function saveBoard(taskId: number, board: unknown) {
+  await pool.query(
+    `INSERT INTO study_boards (task_id, board_json) VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE board_json = VALUES(board_json)`,
+    [taskId, JSON.stringify(board)],
+  )
+}
+
+async function insertMessage(taskId: number, role: string, content: string) {
+  const [result] = await pool.query<ResultSetHeader>(
+    `INSERT INTO study_messages (task_id, role, content) VALUES (?, ?, ?)`,
+    [taskId, role, content],
+  )
+  const [rows] = await pool.query<RowDataPacket[]>(
+    'SELECT created_at FROM study_messages WHERE id = ?',
+    [result.insertId],
+  )
+  return {
+    role,
+    content,
+    created_at: formatMysqlDateTime(rows[0]?.created_at as Date) ?? '',
+  }
+}
+
+async function loadUserMemory(userId: number) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    'SELECT memory_summary FROM user_study_memory WHERE user_id = ?',
+    [userId],
+  )
+  return (rows[0]?.memory_summary as string) ?? ''
+}
+
+async function saveUserMemory(userId: number, summary: string) {
+  await pool.query(
+    `INSERT INTO user_study_memory (user_id, memory_summary) VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE memory_summary = VALUES(memory_summary)`,
+    [userId, summary],
+  )
+}
+
+async function saveSessionMeta(ctx: {
+  task_id: number
+  tutor_phase: string
+  topic_summary: string
+  context_summary: string
+  hints_level: number
+}) {
+  await pool.query(
+    `UPDATE study_sessions
+     SET tutor_phase = ?, topic_summary = ?, context_summary = ?, hints_level = ?
+     WHERE task_id = ?`,
+    [
+      ctx.tutor_phase,
+      ctx.topic_summary,
+      ctx.context_summary,
+      ctx.hints_level,
+      ctx.task_id,
+    ],
+  )
+}
+
+function extractActiveExerciseLine(summary: string) {
+  for (const line of summary.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed.toLowerCase().startsWith('ejercicio activo:')) return truncateChars(trimmed, 180)
+  }
+  return null
+}
+
+function ensureActiveExercise(
+  summary: string,
+  exercise: { title: string; instructions: string } | null,
+  previous: string,
+) {
+  let base = summary.trim()
+  if (exercise) {
+    const line = `Ejercicio activo: ${truncateChars(exercise.title, 60)} — ${truncateChars(exercise.instructions, 140)}`
+    const old = extractActiveExerciseLine(base)
+    base = old ? base.replace(old, line) : base ? `${line}\n${base}` : line
+  } else if (!extractActiveExerciseLine(base)) {
+    const prev = extractActiveExerciseLine(previous)
+    if (prev) base = base ? `${prev}\n${base}` : prev
+  }
+  return truncateChars(base, MAX_CONTEXT)
+}
+
+router.use(requireAuth)
+
+router.get(
+  '/:taskId',
+  asyncHandler(async (req, res) => {
+    const userId = req.user!.id
+    const taskId = Number(req.params.taskId)
+    const task = await fetchTask(taskId, userId)
+    if (!canOpenStudy(task)) {
+      throw new AppError(
+        'Solo puedes abrir el modo estudio en tareas En estudio, o Terminado si son de dificultad Alta',
+      )
+    }
+    const context = await loadContext(taskId)
+    const board = task.uses_board ? await loadBoard(taskId) : emptyBoard()
+    const userMemory = await loadUserMemory(userId)
+
+    if (context.messages.length === 0) {
+      const desc = task.description?.trim()
+      const memoryHint = userMemory.trim()
+        ? ' Si ya practicamos algo antes, podemos retomar desde ahí.'
+        : ''
+      const speak = desc
+        ? `¡Hola! Vi tu tarea "${task.title}": ${truncateChars(desc, 160)}. Estoy aquí para ayudarte paso a paso.${memoryHint} ¿Qué parte quieres practicar primero?`
+        : `¡Hola! Vi tu tarea "${task.title}". Estoy aquí para ayudarte paso a paso.${memoryHint} ¿Qué quieres practicar hoy?`
+      context.topic_summary = task.title
+      context.context_summary = `Inicio local. Tarea: "${task.title}".`
+      context.messages.push(await insertMessage(taskId, 'assistant', speak))
+      await saveSessionMeta(context)
+    }
+
+    res.json({ context, board, task })
+  }),
+)
+
+router.put(
+  '/:taskId/board',
+  asyncHandler(async (req, res) => {
+    const userId = req.user!.id
+    const taskId = Number(req.params.taskId)
+    const task = await fetchTask(taskId, userId)
+    if (!task.uses_board) throw new AppError('Esta tarea no usa pizarra')
+    await saveBoard(taskId, req.body.board ?? req.body)
+    res.json({ ok: true })
+  }),
+)
+
+router.post(
+  '/:taskId/chat',
+  asyncHandler(async (req, res) => {
+    const userId = req.user!.id
+    const taskId = Number(req.params.taskId)
+    const task = await fetchTask(taskId, userId)
+    if (!canOpenStudy(task)) {
+      throw new AppError(
+        'Solo puedes chatear en modo estudio en tareas En estudio, o Terminado si son de dificultad Alta',
+      )
+    }
+
+    const message = String(req.body.user_message ?? req.body.userMessage ?? '').trim()
+    if (!message) throw new AppError('Escribe un mensaje')
+    const allowAiDraw =
+      Boolean(req.body.allow_ai_draw ?? req.body.allowAiDraw) && task.uses_board
+    const boardDescription = task.uses_board
+      ? ((req.body.board_description ?? req.body.boardDescription) as string | null)
+      : null
+    const boardImageBase64 = task.uses_board
+      ? ((req.body.board_image_base64 ?? req.body.boardImageBase64) as string | null)
+      : null
+
+    const context = await loadContext(taskId)
+    const userMemory = await loadUserMemory(userId)
+    context.messages.push(await insertMessage(taskId, 'user', message))
+    const userTurns = context.messages.filter((m) => m.role === 'user').length
+    const updateUserMemory = userTurns % 3 === 0
+
+    const lastTutor =
+      [...context.messages]
+        .reverse()
+        .find((m) => m.role === 'assistant')
+        ?.content ?? ''
+    const boardHas = Boolean(boardDescription?.trim())
+
+    const instruction = allowAiDraw
+      ? boardHas
+        ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes.'
+        : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
+      : boardHas
+        ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo. Evalúa study_eval.'
+        : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo. Ignora pizarra. Evalúa study_eval.'
+
+    const payload = {
+      instruction,
+      update_user_memory: updateUserMemory,
+      user_turns: userTurns,
+      study_passed_already: task.study_passed,
+      task: {
+        title: truncateChars(task.title, 120),
+        description: truncateChars(task.description ?? '', 220),
+        course: task.course_name,
+        difficulty: task.difficulty_name,
+        difficulty_code: task.difficulty_code,
+      },
+      phase: context.tutor_phase,
+      topic_summary: truncateChars(context.topic_summary, 120),
+      context_summary: truncateChars(context.context_summary, MAX_CONTEXT),
+      last_tutor_message: truncateChars(lastTutor, MAX_LAST_TUTOR),
+      user_memory_summary: truncateChars(userMemory, MAX_MEMORY),
+      hints_level: context.hints_level,
+      board_has_drawing: boardHas,
+      child_message: truncateChars(message, 800),
+      ...(allowAiDraw ? { allow_ai_draw: true } : {}),
+      ...(boardHas
+        ? { board_drawing: truncateChars(boardDescription ?? '', MAX_BOARD) }
+        : {}),
+    }
+
+    const raw = await callGemini({
+      system: tutorSystemPrompt(allowAiDraw),
+      user: JSON.stringify(payload),
+      boardImageBase64: boardHas ? boardImageBase64 : null,
+    })
+
+    let value: Record<string, unknown>
+    try {
+      value = JSON.parse(extractJson(raw)) as Record<string, unknown>
+    } catch {
+      throw new AppError(
+        'La IA respondió, pero no en el formato esperado. Probá enviar de nuevo (no gastamos un segundo intento automático para cuidar tokens).',
+      )
+    }
+
+    const exerciseRaw = value.exercise as Record<string, unknown> | null | undefined
+    const exercise =
+      exerciseRaw && typeof exerciseRaw === 'object'
+        ? {
+            id: String(exerciseRaw.id ?? ''),
+            title: String(exerciseRaw.title ?? ''),
+            instructions: String(exerciseRaw.instructions ?? ''),
+            expected_interaction: String(exerciseRaw.expected_interaction ?? ''),
+          }
+        : null
+
+    const phase = String(value.phase ?? 'understanding')
+    const evidence = String(
+      (value.study_eval as { evidence?: string } | undefined)?.evidence ?? '',
+    ).trim()
+
+    // Red de seguridad: Gemini tiende a aprobar pronto; forzar criterios duros.
+    let passed = Boolean(
+      (value.study_eval as { passed?: boolean } | undefined)?.passed,
+    )
+    if (task.study_passed) {
+      passed = true
+    } else {
+      if (userTurns < 5) passed = false
+      if (phase !== 'reviewing') passed = false
+      if (!evidence) passed = false
+    }
+
+    const reply = {
+      phase,
+      speak_to_child: truncateChars(
+        String(value.speak_to_child ?? '¡Genial! Cuéntame un poquito más y seguimos juntos.'),
+        MAX_SPEAK,
+      ),
+      ask_questions: Array.isArray(value.ask_questions)
+        ? (value.ask_questions as unknown[]).map(String)
+        : [],
+      topic_summary: String(value.topic_summary ?? ''),
+      context_summary: ensureActiveExercise(
+        String(value.context_summary ?? context.context_summary),
+        exercise,
+        context.context_summary,
+      ),
+      user_memory_summary: truncateChars(
+        updateUserMemory && String(value.user_memory_summary ?? '').trim()
+          ? String(value.user_memory_summary)
+          : userMemory || `Estudia "${task.title}" (${task.course_name}).`,
+        MAX_MEMORY,
+      ),
+      exercise,
+      draw_ops: allowAiDraw ? normalizeDrawOps(value.draw_ops) : [],
+      hints_level: Number(value.hints_level ?? 0),
+      study_eval: {
+        passed,
+        evidence: task.study_passed && !evidence ? 'ya aprobado' : evidence,
+      },
+    }
+
+    context.tutor_phase = reply.phase
+    if (reply.topic_summary.trim()) {
+      context.topic_summary = truncateChars(reply.topic_summary, 120)
+    }
+    context.context_summary = reply.context_summary
+    context.hints_level = reply.hints_level
+
+    let visible = reply.speak_to_child
+    if (reply.ask_questions.length) {
+      visible += '\n\n'
+      reply.ask_questions.forEach((q, i) => {
+        visible += `${i + 1}. ${q}\n`
+      })
+    }
+    if (reply.exercise) {
+      visible += `\nEjercicio: ${reply.exercise.title}\n${reply.exercise.instructions}`
+    }
+    context.messages.push(await insertMessage(taskId, 'assistant', visible))
+    await saveSessionMeta(context)
+    if (updateUserMemory) await saveUserMemory(userId, reply.user_memory_summary)
+    if (reply.study_eval.passed) {
+      await pool.query('UPDATE tasks SET study_passed = 1 WHERE id = ? AND user_id = ?', [
+        taskId,
+        userId,
+      ])
+    }
+
+    res.json({
+      reply,
+      context,
+      study_passed: task.study_passed || reply.study_eval.passed,
+    })
+  }),
+)
+
+export default router
