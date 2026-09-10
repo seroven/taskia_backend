@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS study_challenge_questions (
   options_json JSON NULL COMMENT 'Para multiple_choice: ["A","B","C","D"]',
   answer_key TEXT NOT NULL COMMENT 'Clave o criterio breve para autocorregir',
   requires_board TINYINT(1) NOT NULL DEFAULT 0,
+  prompt_draw_ops JSON NULL COMMENT 'draw_ops de la IA: el problema dibujado en pizarra',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_study_challenge_questions_challenge (challenge_id, sort_order),

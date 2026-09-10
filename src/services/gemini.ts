@@ -14,10 +14,17 @@ export interface LlmUsageContext {
   kind: LlmUsageKind
 }
 
+function stripImageDataUrl(raw: string) {
+  return raw
+    .replace(/^data:image\/png;base64,/, '')
+    .replace(/^data:image\/jpeg;base64,/, '')
+}
+
 export async function callGemini(opts: {
   system: string
   user: string
   boardImageBase64?: string | null
+  boardImages?: Array<{ data: string; caption?: string }>
   usage?: LlmUsageContext
 }): Promise<string> {
   const apiKey = env.gemini.apiKey.trim().replace(/^["']|["']$/g, '')
@@ -25,13 +32,24 @@ export async function callGemini(opts: {
   const model = env.gemini.model.trim().replace(/^["']|["']$/g, '') || 'gemini-2.0-flash'
 
   const parts: Array<Record<string, unknown>> = [{ text: opts.user }]
-  const raw = opts.boardImageBase64?.trim()
-  if (raw) {
-    const data = raw
-      .replace(/^data:image\/png;base64,/, '')
-      .replace(/^data:image\/jpeg;base64,/, '')
+  const images =
+    opts.boardImages && opts.boardImages.length > 0
+      ? opts.boardImages
+      : opts.boardImageBase64?.trim()
+        ? [
+            {
+              data: opts.boardImageBase64,
+              caption: 'Imagen de la pizarra del niño. Úsala solo si aporta.',
+            },
+          ]
+        : []
+  for (const image of images) {
+    const data = stripImageDataUrl(image.data.trim())
+    if (!data) continue
     parts.push({ inline_data: { mime_type: 'image/png', data } })
-    parts.push({ text: 'Imagen de la pizarra del niño. Úsala solo si aporta.' })
+    if (image.caption) {
+      parts.push({ text: image.caption })
+    }
   }
 
   const generationConfig: Record<string, unknown> = {

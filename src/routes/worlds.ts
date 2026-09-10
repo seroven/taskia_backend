@@ -8,6 +8,10 @@ import {
   AppError,
   extractJson,
   formatMysqlDateTime,
+  looksLikeAskingMoreTopicContent,
+  looksLikeOfferingMorePractice,
+  requiredChatTurns,
+  soloBienCount,
   truncateChars,
 } from '../utils/helpers.js'
 
@@ -256,6 +260,222 @@ Ejemplo (triángulo base 8 altura 4):
 [{"op":"clear_board"},{"op":"stamp","id":"right_triangle","x":0,"y":0,"scale":2},{"op":"shape","type":"text","x":110,"y":175,"label":"8"},{"op":"shape","type":"text","x":-30,"y":70,"label":"4"}]
 `
 
+const CHALLENGE_BOARD_DRAW_OPS = `Pizarra del ENUNCIADO (SOLO si kind=board_prompt y requires_board=true):
+- Esto NO es un tutor: no converses, no des pistas, no dibujes la solución.
+- "prompt" = instrucción breve (qué hay que hacer).
+- "draw_ops" = lo que el niño DEBE VER para resolver. Tiene que coincidir con el tema del prompt.
+- Si la pregunta NO usa pizarra (requires_board=false): draw_ops SIEMPRE []. No dibujes nada.
+
+Cómo elegir las ops (regla dura):
+1) Ecuación, cálculo, despejar, completar un número: SOLO texto grande con la expresión EXACTA.
+   PROHIBIDO square, rectangle, circle, triangle, stamps.
+   Ejemplo: prompt "Resuelve la ecuación"
+   [{"op":"clear_board"},{"op":"shape","type":"text","x":0,"y":0,"label":"x + 5 = 12"}]
+2) Geometría (área, perímetro, figura): usa el stamp/shape de ESA figura + labels de las medidas.
+   Un square SOLO si el problema es un cuadrado. Un triángulo SOLO si es un triángulo.
+3) Recta numérica: stamp number_line + marcas/texto.
+4) Frase o dato: texto del dato, sin recuadro.
+
+NUNCA enmarques el problema con un rectángulo o cuadrado “de adorno”.
+NUNCA dejes draw_ops vacío si requires_board=true. Empieza con {"op":"clear_board"}.
+Stamps permitidos: right_triangle, circle, square, number_line, arrow.
+Shapes: rectangle|ellipse|triangle|line|arrow|text (x,y,w,h,label?,color?).
+`
+
+function drawableOps(raw: unknown): unknown[] {
+  return normalizeDrawOps(raw).filter((op) => {
+    if (!op || typeof op !== 'object') return false
+    const kind = String((op as { op?: string }).op ?? '')
+    return kind !== 'clear_board' && kind !== 'clear_layer' && kind !== 'clear'
+  })
+}
+
+function hasUsableDrawOps(raw: unknown) {
+  return drawableOps(raw).length > 0
+}
+
+function looksLikeSymbolicPrompt(prompt: string) {
+  const t = prompt.toLowerCase()
+  return /ecuaci|inc[oó]gnit|despej|\bx\s*[=+\-]|[=+\-×x*/÷]\s*\d|\d+\s*[=+\-×x*/÷]/.test(
+    t,
+  )
+}
+
+function drawOpsHaveProblemText(ops: unknown) {
+  return drawableOps(ops).some((op) => {
+    if (!op || typeof op !== 'object') return false
+    const rec = op as { op?: string; type?: string; label?: string; id?: string }
+    if (rec.op === 'shape' && rec.type === 'text' && String(rec.label ?? '').trim()) {
+      return true
+    }
+    return false
+  })
+}
+
+function isFrameShape(op: unknown) {
+  if (!op || typeof op !== 'object') return false
+  const rec = op as { op?: string; type?: string; id?: string }
+  if (rec.op === 'stamp' && rec.id === 'square') return true
+  if (rec.op === 'shape' && (rec.type === 'rectangle' || rec.type === 'square')) {
+    return true
+  }
+  return false
+}
+
+function sanitizeBoardDrawOps(prompt: string, ops: unknown): unknown[] {
+  let next = normalizeDrawOps(ops)
+  if (looksLikeSymbolicPrompt(prompt)) {
+    next = next.filter((op) => !isFrameShape(op))
+  }
+  return next
+}
+
+function drawOpsAreGenericFrame(ops: unknown) {
+  const drawable = drawableOps(ops)
+  if (drawable.length === 0) return true
+  return drawable.every(isFrameShape) && !drawOpsHaveProblemText(ops)
+}
+
+function itemWantsBoard(
+  item: Record<string, unknown>,
+  missionUsesBoard: boolean,
+) {
+  if (!missionUsesBoard) return false
+  const kind = String(item.kind ?? '')
+  if (
+    kind === 'multiple_choice' ||
+    kind === 'short_text' ||
+    kind === 'fill_blank'
+  ) {
+    return false
+  }
+  if (kind === 'board_prompt') return true
+  return item.requires_board === true || item.requires_board === 1
+}
+
+function drawOpsFitPrompt(prompt: string, ops: unknown) {
+  if (!hasUsableDrawOps(ops)) return false
+  if (drawOpsAreGenericFrame(ops)) return false
+  if (looksLikeSymbolicPrompt(prompt) && !drawOpsHaveProblemText(ops)) return false
+  return true
+}
+
+function fallbackDrawOpsForPrompt(prompt: string): unknown[] {
+  const label = truncateChars(prompt.trim() || 'Resuelve en la pizarra', 80)
+  return [
+    { op: 'clear_board' },
+    { op: 'shape', type: 'text', x: 0, y: 0, label },
+  ]
+}
+
+function describeBoardJson(raw: unknown): string {
+  if (raw == null) return ''
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed) return ''
+    try {
+      value = JSON.parse(trimmed) as unknown
+    } catch {
+      return truncateChars(trimmed, 800)
+    }
+  }
+  if (!value || typeof value !== 'object') return ''
+  const rec = value as { elements?: unknown }
+  const elements = Array.isArray(rec.elements) ? rec.elements : []
+  const alive = elements.filter((el) => {
+    if (!el || typeof el !== 'object') return false
+    return !(el as { isDeleted?: boolean }).isDeleted
+  }) as Array<Record<string, unknown>>
+  if (alive.length === 0) return 'La pizarra está vacía.'
+  const lines = alive.slice(0, 40).map((el, index) => {
+    const type = String(el.type ?? 'forma')
+    const text = typeof el.text === 'string' ? el.text.trim() : ''
+    const layer =
+      el.customData && typeof el.customData === 'object'
+        ? String((el.customData as { layer?: string }).layer ?? '')
+        : ''
+    const who = layer === 'ai' ? 'enunciado' : 'alumno'
+    if (type === 'text' && text) return `${index + 1}. [${who}] texto "${text}"`
+    if (text) return `${index + 1}. [${who}] ${type} "${text}"`
+    return `${index + 1}. [${who}] ${type}`
+  })
+  const extra = alive.length > 40 ? `\n…y ${alive.length - 40} elementos más.` : ''
+  return `La pizarra tiene ${alive.length} elemento(s):\n${lines.join('\n')}${extra}`
+}
+
+async function ensureChallengeBoardDrawOps(
+  items: Array<Record<string, unknown>>,
+  missions: MissionRow[],
+  userId: number,
+) {
+  const byId = new Map(missions.map((m) => [m.id, m]))
+  const boardItems: Array<{ item: Record<string, unknown>; prompt: string }> = []
+  for (const item of items) {
+    let mid =
+      typeof item.mission_id === 'number'
+        ? item.mission_id
+        : Number(item.mission_id)
+    if (!Number.isFinite(mid) || !byId.has(mid)) mid = missions[0]?.id ?? 0
+    const mission = byId.get(mid)
+    if (!itemWantsBoard(item, Boolean(mission?.uses_board))) continue
+    boardItems.push({
+      item,
+      prompt: typeof item.prompt === 'string' ? item.prompt : '¿Listo?',
+    })
+  }
+  if (boardItems.length === 0) return
+
+  const toDraw = boardItems.filter(
+    (row) => !drawOpsFitPrompt(row.prompt, row.item.draw_ops),
+  )
+
+  if (toDraw.length > 0) {
+    try {
+      const raw = await callGemini({
+        system: `Dibujas el ENUNCIADO de problemas de pizarra para niños ~10 años.
+NO dibujes la solución. NO enseñes. Responde SOLO un JSON array.
+Cada ítem: {"index":0,"draw_ops":[...]}
+${CHALLENGE_BOARD_DRAW_OPS}
+Si el prompt menciona una ecuación o un cálculo, el label de texto DEBE ser esa expresión (ej. "x + 5 = 12"), no un cuadrado.
+Incluye exactamente un objeto por cada problema recibido.`,
+        user: JSON.stringify({
+          problems: toDraw.map((row, index) => ({
+            index,
+            prompt: row.prompt,
+            answer_key:
+              typeof row.item.answer_key === 'string' ? row.item.answer_key : '',
+          })),
+        }),
+        usage: { userId, kind: 'challenge_generate' },
+      })
+      const parsed = JSON.parse(extractJson(raw)) as unknown
+      if (Array.isArray(parsed)) {
+        for (const row of parsed) {
+          if (!row || typeof row !== 'object') continue
+          const rec = row as Record<string, unknown>
+          const index = Number(rec.index)
+          if (!Number.isFinite(index) || !toDraw[index]) continue
+          if (drawOpsFitPrompt(toDraw[index]!.prompt, rec.draw_ops)) {
+            toDraw[index]!.item.draw_ops = sanitizeBoardDrawOps(
+              toDraw[index]!.prompt,
+              rec.draw_ops,
+            )
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[challenge:board-ops] no se pudieron completar draw_ops', err)
+    }
+  }
+
+  for (const row of boardItems) {
+    if (!drawOpsFitPrompt(row.prompt, row.item.draw_ops)) {
+      row.item.draw_ops = fallbackDrawOpsForPrompt(row.prompt)
+    }
+  }
+}
+
 function missionTutorPrompt(allowAiDraw: boolean): string {
   let p = `Tutor amable para niño ~10 años. Español latinoamericano, claro y breve.
 Enseñas un TEMA completo (misión), no una tarea escolar suelta. Guía con preguntas/pistas; no des la solución completa.
@@ -271,23 +491,35 @@ RECORRIDO OBLIGATORIO del tema (no saltes etapas):
 3) Observación: preguntas que exigen fijarse en detalles (orden de hechos, diferencias, causas, “¿qué pasaría si…?”, un ejemplo propio, un detalle que mencionó antes).
 Cubre el tema ENTERO. Si el material tiene varias ideas, recórrelas; no apruebes por un solo fragmento bien dicho.
 
-Dominio (study_eval.passed=true) SOLO si TODOS se cumplen. Si falta uno → passed=false:
-1) phase=reviewing (nunca en understanding ni practicing)
-2) user_turns ≥ 7
-3) ≥3 aciertos reales (no “sí/ok/ya/listo”), en ideas DISTINTAS del tema
-4) al menos 1 acierto básico Y al menos 2 aciertos de observación/aplicación
-5) el niño pudo explicar el tema de punta a punta (las ideas principales, no un dato suelto)
-6) no regalaste las respuestas completas en esos turnos
-7) evidence cita en 1–2 frases QUÉ demostró y qué partes del tema cubrió; si no puedes citarlo → passed=false
-Por defecto passed=false. Sé MUY estricto: un tema corto mal explicado o solo preguntas fáciles NO es dominio al 100%.
 Si mastered_already=true → passed=true y evidence "ya dominado".
-Si passed=true, celebra en speak_to_child y di que ya dominó el tema.
 Si message_source=voice: el niño habló (audio transcrito). Usa ese relato para afinar topic_summary (de qué trata el tema) y context_summary. En speak_to_child, resume en 1 frase lo que entendiste y sigue guiando; no menciones micrófonos ni transcripción.
 `
   if (!allowAiDraw) {
-    p += 'draw_ops siempre []. No dibujes en la pizarra. Todo el recorrido (básico + observación) ocurre en el chat.'
+    p += `draw_ops siempre []. No dibujes en la pizarra. Todo el recorrido (básico + observación) ocurre en el chat.
+En context_summary lleva SIEMPRE "Errores: N" (N = veces que el niño se equivocó). Si se equivoca, la siguiente pregunta refuerza ese punto débil. Pregunta TODO lo posible del tema (hechos, causas, detalles, ejemplos).
+Dominio (study_eval.passed=true) SOLO si TODOS se cumplen. Si falta uno → passed=false:
+1) phase=reviewing (nunca en understanding ni practicing)
+2) Piso de mensajes del niño: user_turns ≥ 10 + Errores. Si user_turns < 10+N → passed=false SIEMPRE. Cada error sube el piso.
+3) Cubriste el tema de punta a punta (no un dato suelto). No basta “sí/ok/ya/listo”.
+4) no regalaste las respuestas completas en esos turnos
+5) Cuando el piso ya se cumple, NO marques passed=true en ese mismo turno. Primero, con tono cálido, pregunta si queda MÁS CONTENIDO de este tema que necesiten estudiar. En ese turno passed=false y anota en context_summary "Cierre: preguntado".
+6) passed=true SOLO después, si dice que no / que ya está / que no hay más. Entonces celebra y dile que ya dominó el tema.
+7) Si pide más, sigue recorriendo ese contenido (passed=false, quita "Cierre: preguntado"). Cuando cierre y no quiera más, passed=true.
+8) evidence cita en 1–2 frases QUÉ demostró y qué partes cubrió; si no puedes citarlo → passed=false
+Por defecto passed=false.
+`
   } else {
     p += MISSION_DRAW_OPS_PROMPT
+    p += `El recorrido básico → observación sirve para explicar el tema; NO exijas 7 turnos ni 3 aciertos de chat. El dominio se decide con los 2 problemas en pizarra.
+Dominio CON PIZARRA (study_eval.passed=true) SOLO si TODOS se cumplen:
+1) El niño resolvió 2 problemas DISTINTOS él solo: sin que le dictes la respuesta ni el paso clave, y sin errores. Si se equivoca o lo ayudas a resolverlo, ese intento NO cuenta; plantea otro para que lo intente solo.
+2) En context_summary lleva SIEMPRE "Solo bien: N/2" (N = problemas resueltos solo).
+3) Cuando N llega a 2, NO marques passed=true en ese mismo turno. Primero, con tono cálido de tutor, pregúntale si quiere practicar OTRO TIPO de ejercicio de este mismo tema (un formato distinto). En ese turno passed=false.
+4) passed=true SOLO después, si dice que no / que ya está / que no quiere más. Entonces celebra y dile que ya dominó el tema.
+5) Si pide más, dale ese otro tipo (passed=false). Cuando cierre y no quiera más, passed=true (los 2 solos ya valen).
+6) phase=reviewing. evidence cita los 2 problemas que resolvió solo. Si no puedes citarlos → passed=false.
+Por defecto passed=false.
+`
   }
   return p
 }
@@ -475,8 +707,30 @@ async function generateQuestionsBatch(
         ? `- Alcance MUNDO: estas misiones son de UNA sola materia. Mezcla los temas DENTRO de esta materia.`
         : `- Alcance TEMA: todas las preguntas son de esta misión.`
 
+  const boardMissionCount = missions.filter((m) => m.uses_board).length
+  const maxTheoIfBoard = Math.round(count / 11)
+  const minBoardIfBoard = Math.max(0, count - maxTheoIfBoard)
+  const boardMixRules =
+    boardMissionCount === 0
+      ? `Reglas de tipo (SIN pizarra):
+- NUNCA kind="board_prompt"; requires_board=false; draw_ops=[].
+- La mayoría deben ser EJERCICIOS en texto (aplicar, elegir un caso concreto). Teóricas (definir, “qué es…”, nombrar SIN resolver) como máximo 1 o 2 en el lote, salvo que el material sea solo conceptual.`
+      : `Reglas de tipo (PIZARRA):
+- Primero decidí si el tema de cada misión REQUIERE pizarra para practicar.
+  SÍ requiere: hay que calcular, despejar, construir, dibujar una figura/diagrama o mostrar un procedimiento en el lienzo.
+  NO requiere: solo se nombra, define, fecha, clasifica o reconoce (aunque uses_board=true). Entonces NO uses pizarra: trátalo como teórico (MCQ/texto).
+- Si SÍ requiere pizarra: priorizá ejercicios prácticos en el lienzo. Relación OBLIGATORIA ≈ 1 pregunta teórica por cada 10 de pizarra (unas 1 de cada 11 es teórica).
+  Teórica = multiple_choice / short_text / fill_blank (definir o nombrar). El resto = kind="board_prompt".
+  NO conviertas un cálculo o procedimiento en opción múltiple para evitar la pizarra.
+${
+  boardMissionCount === missions.length
+    ? `  En ESTE lote de ${count}: máximo ${maxTheoIfBoard} teórica(s) y al menos ${minBoardIfBoard} board_prompt (si el tema sí se resuelve en el lienzo).`
+    : `  Aplica esa proporción 1/10 a las preguntas de las misiones que sí se resuelven en el lienzo. Misiones uses_board=false: NUNCA board_prompt.`
+}
+- uses_board=false: NUNCA board_prompt; requires_board=false; draw_ops=[].`
+
   const system = `Generas preguntas de desafío para niños ~10 años. Español latinoamericano neutro.
-NO enseñes: solo preguntas evaluables. Responde SOLO un JSON array (sin markdown).
+NO enseñes y NO converses: solo enunciados evaluables. Responde SOLO un JSON array (sin markdown).
 
 REGLA DE CONTENIDO (la más importante):
 - Pregunta SOLO sobre hechos, nombres, fechas, ideas o ejemplos que aparezcan en studied_text, topic_summary, context_summary o description de la misión.
@@ -487,8 +741,9 @@ REGLA DE CONTENIDO (la más importante):
 
 CUOTA (obligatorio):
 - El objetivo es generar ${count} preguntas DISTINTAS. Intenta LLEGAR a esa cantidad.
-- Cubre todos los hechos útiles del material: personas, lugares, fechas, causas, consecuencias, ejemplos, definiciones, orden de eventos.
-- Cambia el ángulo o el formato (opción múltiple, texto corto, completar) para aprovechar el mismo material SIN repetir ni parafrasear la misma pregunta.
+- Cubre todos los hechos útiles del material. Si el tema se resuelve en pizarra, cubrí tipos de ejercicio distintos (números o casos distintos), no un rosario de definiciones.
+- Si el tema es conceptual, cubrí personas, lugares, fechas, causas, consecuencias, ejemplos, definiciones, orden de eventos.
+- Cambia el ángulo o el formato para aprovechar el mismo material SIN repetir ni parafrasear la misma pregunta.
 - Solo devolvé MENOS de ${count} si de verdad ya no queda ningún hecho o detalle distinto. Un recorte grande está mal si el material aún da para más.
 - NUNCA inventes datos que no estén en el material para rellenar (p. ej. no armes un examen de 80 con dos temas cortos).
 
@@ -498,32 +753,38 @@ Formato EXACTO de cada ítem:
 {
   "mission_id": <number de la lista>,
   "kind": "multiple_choice" | "short_text" | "fill_blank" | "board_prompt",
-  "prompt": "texto de la pregunta",
+  "prompt": "texto de la pregunta / enunciado",
   "options": ["texto opción 1","texto opción 2","texto opción 3","texto opción 4"] | null,
-  "answer_key": "A" | "B" | "C" | "D" | "respuesta breve",
-  "requires_board": true | false
+  "answer_key": "A" | "B" | "C" | "D" | "respuesta breve o criterio",
+  "requires_board": true | false,
+  "draw_ops": [] | [ops de pizarra]
 }
 
-Reglas de tipo:
-1) Si uses_board=true → kind="board_prompt", requires_board=true, options=null, answer_key=criterio breve según el material estudiado.
-2) Si uses_board=false → SOLO "multiple_choice", "short_text" o "fill_blank"; requires_board=false.
-3) Si kind="multiple_choice":
-   - options = exactamente 4 strings (sin prefijo "A)" / "B)").
-   - answer_key = solo "A"|"B"|"C"|"D" (A=primera opción).
-   - Nunca options=null ni [].
-4) Si kind="short_text" o "fill_blank": options=null; answer_key=respuesta breve tomada del material.
-5) Devolvé como máximo ${count} preguntas. mission_id debe existir en la lista.
-6) Mezcla tipos cuando uses_board=false (incluye varias multiple_choice) si hay material suficiente.
+${boardMixRules}
 
-Ejemplo (solo válido si esos datos están en studied_text):
-{"mission_id":1,"kind":"multiple_choice","prompt":"Según lo que estudiaste, ¿quién llegó desde el sur?","options":["José de San Martín","Simón Bolívar","Francisco Pizarro","Tupac Amaru"],"answer_key":"A","requires_board":false}`
+Formato de cada tipo:
+- kind="multiple_choice": options = exactamente 4 strings (sin prefijo "A)" / "B)"); answer_key = solo "A"|"B"|"C"|"D" (A=primera opción); nunca options=null ni []; requires_board=false; draw_ops=[].
+- kind="short_text" o "fill_blank": options=null; answer_key=respuesta breve tomada del material; requires_board=false; draw_ops=[].
+- kind="board_prompt": options=null; answer_key=criterio breve de corrección; requires_board=true; draw_ops=[] (el dibujo del enunciado se arma después).
+- Si requires_board=false: draw_ops SIEMPRE [].
+- Devolvé como máximo ${count} preguntas. mission_id debe existir en la lista.
+
+Ejemplo teórica (solo si esos datos están en studied_text):
+{"mission_id":1,"kind":"multiple_choice","prompt":"Según lo que estudiaste, ¿quién llegó desde el sur?","options":["José de San Martín","Simón Bolívar","Francisco Pizarro","Tupac Amaru"],"answer_key":"A","requires_board":false,"draw_ops":[]}
+Ejemplo pizarra (solo si el tema se resuelve en el lienzo):
+{"mission_id":1,"kind":"board_prompt","prompt":"Resuelve en la pizarra: 3/4 + 1/8","options":null,"answer_key":"7/8","requires_board":true,"draw_ops":[]}`
 
   const user = JSON.stringify({
     target_count: count,
     batch_offset: batchOffset,
     already_asked: options.avoidPrompts ?? [],
     missions: catalog,
-    instruction: `Genera ${count} preguntas nuevas, distintas entre sí y distintas de already_asked. ÚNICAMENTE con base en studied_text / topic_summary / context_summary / description. Esfuérzate por llegar a ${count} cubriendo hechos diferentes. Solo entrega menos si el material ya no alcanza para una pregunta nueva y justa.`,
+    instruction:
+      boardMissionCount === 0
+        ? `Genera ${count} preguntas nuevas, distintas entre sí y distintas de already_asked. Casi todas EJERCICIOS en texto; teóricas como máximo 1 o 2 (salvo material solo conceptual). Sin pizarra. ÚNICAMENTE con base en studied_text / topic_summary / context_summary / description.`
+        : boardMissionCount === missions.length
+          ? `Genera ${count} preguntas nuevas, distintas entre sí y distintas de already_asked. Si el tema se resuelve en el lienzo: máximo ${maxTheoIfBoard} teórica(s) y al menos ${minBoardIfBoard} board_prompt (relación 1 teórica / 10 pizarra). Si el tema NO pide pizarra para practicar (solo nombrar/definir), no inventes board_prompt. ÚNICAMENTE con base en studied_text / topic_summary / context_summary / description.`
+          : `Genera ${count} preguntas nuevas, distintas entre sí y distintas de already_asked. En misiones que sí se resuelven en pizarra: ~1 teórica por cada 10 board_prompt. En misiones conceptuales o uses_board=false: texto/MCQ, sin pizarra. ÚNICAMENTE con base en studied_text / topic_summary / context_summary / description.`,
   })
 
   const raw = await callGemini({
@@ -703,7 +964,7 @@ export async function getChallengeDetail(challengeId: number, userId: number) {
 
   const [qrows] = await pool.query<RowDataPacket[]>(
     `SELECT q.id, q.mission_id, q.sort_order, q.kind, q.prompt, q.options_json,
-            q.answer_key, q.requires_board,
+            q.answer_key, q.requires_board, q.prompt_draw_ops,
             a.is_correct, a.user_answer,
             m.course_id, c.name AS course_name
      FROM study_challenge_questions q
@@ -740,6 +1001,10 @@ export async function getChallengeDetail(challengeId: number, userId: number) {
       prompt: q.prompt as string,
       options,
       requires_board: Number(q.requires_board) !== 0,
+      prompt_draw_ops:
+        Number(q.requires_board) !== 0
+          ? normalizeDrawOps(q.prompt_draw_ops)
+          : [],
       answered,
       is_correct: q.is_correct == null ? null : Number(q.is_correct) !== 0,
       user_answer: null as string | null,
@@ -801,20 +1066,32 @@ async function gradeOpenAnswersBatch(
     answer_key: string
     child_answer: string
     requires_board: boolean
-    board_json_snip: string
+    board_description: string
   }>,
   userId: number,
+  boardImages: Array<{ question_id: number; data: string }> = [],
 ): Promise<Map<number, boolean>> {
   const results = new Map<number, boolean>()
   if (items.length === 0) return results
 
+  const images = boardImages.slice(0, 6).map((image) => ({
+    data: image.data,
+    caption: `Pizarra del alumno para question_id=${image.question_id}. Úsala para juzgar el dibujo, no el enunciado de la IA.`,
+  }))
+
   const raw = await callGemini({
     system: `Juzgas si las respuestas del niño son correctas según answer_key.
 NO des pistas ni enseñes. Sé razonable con variaciones de redacción.
+Para preguntas de pizarra (requires_board=true):
+- El niño NO conversó con un tutor. Solo dibujó la resolución y, a veces, dejó una nota breve.
+- Juzga sobre todo board_description (y la imagen si viene). La nota es apoyo, no un chat.
+- Distingue el enunciado dibujado por la IA ([enunciado]) de lo que agregó el alumno ([alumno]).
+- correct=true solo si el alumno resolvió el problema, no por copiar el enunciado.
 Responde SOLO un JSON array:
 [{"question_id":1,"correct":true|false}]
 Debes incluir exactamente un objeto por cada pregunta recibida.`,
     user: JSON.stringify({ items }),
+    boardImages: images,
     usage: { userId, kind: 'challenge_grade' },
   })
   console.log('[challenge:grade-batch] raw Gemini response:\n', raw)
@@ -1003,8 +1280,8 @@ router.post(
     const boardHas = Boolean(boardDescription?.trim())
 
     let instruction = allowAiDraw
-      ? 'Responde breve. Enseña el tema completo (básico + observación). Conserva ejercicio activo. Evalúa study_eval con criterio estricto. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
-      : 'Responde breve. Enseña el tema completo (básico + observación). Conserva ejercicio activo. Evalúa study_eval con criterio estricto. Sin pizarra.'
+      ? 'Responde breve. Conserva ejercicio activo. Anota "Solo bien: N/2". Evalúa study_eval: 2 problemas resueltos solo; al llegar a 2 pregunta si quiere otro tipo de ejercicio (passed=false); passed=true solo si declina. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
+      : 'Responde breve. Enseña el tema completo (básico + observación). Conserva ejercicio activo. Anota "Errores: N". Piso user_turns ≥ 10+N. Pregunta todo lo posible del tema. Al cumplir el piso pregunta si queda más contenido (passed=false); passed=true solo si declina. Sin pizarra.'
     if (fromVoice) {
       instruction +=
         ' El mensaje viene de voz (transcrito): prioriza afinar topic_summary y context_summary con lo que explicó el niño.'
@@ -1085,9 +1362,32 @@ router.post(
       },
     }
 
-    if (userTurns < 7) reply.study_eval.passed = false
+    if (!allowAiDraw) {
+      if (userTurns < requiredChatTurns(10, reply.context_summary)) {
+        reply.study_eval.passed = false
+      }
+      const askingMoreContent =
+        looksLikeAskingMoreTopicContent(reply.speak_to_child) ||
+        reply.ask_questions.some((q) => looksLikeAskingMoreTopicContent(q))
+      if (askingMoreContent) reply.study_eval.passed = false
+      if (
+        reply.study_eval.passed &&
+        !looksLikeAskingMoreTopicContent(lastTutorMsg?.content ?? '') &&
+        !/cierre:\s*preguntado/i.test(context.context_summary)
+      ) {
+        reply.study_eval.passed = false
+      }
+    }
     if (reply.phase !== 'reviewing') reply.study_eval.passed = false
     if (!reply.study_eval.evidence.trim()) reply.study_eval.passed = false
+    if (allowAiDraw) {
+      const offeringMore =
+        looksLikeOfferingMorePractice(reply.speak_to_child) ||
+        reply.ask_questions.some((q) => looksLikeOfferingMorePractice(q))
+      if (offeringMore) reply.study_eval.passed = false
+      const n = soloBienCount(reply.context_summary)
+      if (n !== null && n < 2) reply.study_eval.passed = false
+    }
     if (mission.status === 'mastered') reply.study_eval.passed = true
 
     let visible = reply.speak_to_child
@@ -1238,6 +1538,12 @@ router.post(
       throw err
     }
 
+    try {
+      await ensureChallengeBoardDrawOps(generated, missions, userId)
+    } catch (err) {
+      console.error('[challenge:start] ensure board draw_ops failed', err)
+    }
+
     const missionIds = new Set(missions.map((m) => m.id))
     let sortOrder = 0
     for (const item of generated.slice(0, total)) {
@@ -1253,10 +1559,10 @@ router.post(
 
       let kind =
         typeof item.kind === 'string' ? item.kind : 'short_text'
-      let requiresBoard: boolean
-      if (mission.uses_board) {
+      const wantsBoard = itemWantsBoard(item, mission.uses_board)
+      let requiresBoard = wantsBoard
+      if (wantsBoard) {
         kind = 'board_prompt'
-        requiresBoard = true
       } else {
         requiresBoard = false
         if (kind === 'board_prompt') kind = 'multiple_choice'
@@ -1295,11 +1601,18 @@ router.post(
         options,
       )
       const optionsJson = options == null ? null : JSON.stringify(options)
+      const promptDrawOps = requiresBoard
+        ? JSON.stringify(
+            drawOpsFitPrompt(prompt, item.draw_ops)
+              ? normalizeDrawOps(item.draw_ops)
+              : fallbackDrawOpsForPrompt(prompt),
+          )
+        : null
 
       await pool.query(
         `INSERT INTO study_challenge_questions
-           (challenge_id, mission_id, sort_order, kind, prompt, options_json, answer_key, requires_board)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           (challenge_id, mission_id, sort_order, kind, prompt, options_json, answer_key, requires_board, prompt_draw_ops)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           challengeId,
           mid,
@@ -1309,6 +1622,7 @@ router.post(
           optionsJson,
           answerKey,
           requiresBoard ? 1 : 0,
+          promptDrawOps,
         ],
       )
       sortOrder += 1
@@ -1391,7 +1705,12 @@ router.post(
 
     const answerMap = new Map<
       number,
-      { user_answer: string; board_json: unknown }
+      {
+        user_answer: string
+        board_json: unknown
+        board_description: string
+        board_image_base64: string
+      }
     >()
     for (const row of answersRaw) {
       if (!row || typeof row !== 'object') continue
@@ -1402,6 +1721,10 @@ router.post(
         user_answer:
           typeof obj.user_answer === 'string' ? obj.user_answer : '',
         board_json: obj.board_json ?? null,
+        board_description:
+          typeof obj.board_description === 'string' ? obj.board_description : '',
+        board_image_base64:
+          typeof obj.board_image_base64 === 'string' ? obj.board_image_base64 : '',
       })
     }
 
@@ -1426,8 +1749,9 @@ router.post(
       answer_key: string
       child_answer: string
       requires_board: boolean
-      board_json_snip: string
+      board_description: string
     }> = []
+    const boardImages: Array<{ question_id: number; data: string }> = []
     const graded = new Map<number, boolean>()
 
     for (const q of qrows) {
@@ -1441,21 +1765,27 @@ router.post(
       if (kind === 'multiple_choice') {
         graded.set(qid, gradeMultipleChoice(answerText, answerKey))
       } else {
-        const boardSnip = submitted.board_json
-          ? truncateChars(JSON.stringify(submitted.board_json), 500)
-          : ''
+        const boardDescription =
+          submitted.board_description.trim() ||
+          describeBoardJson(submitted.board_json)
         openItems.push({
           question_id: qid,
           prompt: String(q.prompt ?? ''),
           answer_key: answerKey,
           child_answer: truncateChars(answerText, 800),
           requires_board: requiresBoard,
-          board_json_snip: boardSnip,
+          board_description: truncateChars(boardDescription, 1600),
         })
+        if (requiresBoard && submitted.board_image_base64.trim()) {
+          boardImages.push({
+            question_id: qid,
+            data: submitted.board_image_base64,
+          })
+        }
       }
     }
 
-    const openGrades = await gradeOpenAnswersBatch(openItems, userId)
+    const openGrades = await gradeOpenAnswersBatch(openItems, userId, boardImages)
     for (const [qid, correct] of openGrades) graded.set(qid, correct)
 
     // Limpia respuestas previas (por si reintento) y guarda todo de una vez

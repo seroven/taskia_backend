@@ -69,3 +69,44 @@ export function extractJson(text: string): string {
   if (!match) throw new AppError('La IA no devolvió JSON válido')
   return match[0]
 }
+
+/** El tutor está ofreciendo más práctica en vez de cerrar dominio. */
+export function looksLikeOfferingMorePractice(text: string): boolean {
+  const t = text.toLowerCase()
+  return /otro tipo|otra clase de|más ejercicio|otro ejercicio|te gustaría practicar|quieres practicar|practicamos otro|quieres otro|otro formato|más práctica|otra forma de/.test(
+    t,
+  )
+}
+
+/** Contador "Solo bien: N/2" del context_summary (pizarra). */
+export function soloBienCount(summary: string): number | null {
+  const m = summary.match(/solo bien:\s*(\d+)\s*\/\s*2/i)
+  return m ? Number(m[1]) : null
+}
+
+/** Errores anotados en context_summary ("Errores: N"). */
+export function trackedErrorCount(summary: string): number {
+  const m = summary.match(/errores:\s*(\d+)/i)
+  if (!m) return 0
+  const n = Number(m[1])
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+export function requiredChatTurns(base: number, summary: string): number {
+  return base + trackedErrorCount(summary)
+}
+
+/** Misión teórica: el tutor pregunta si queda más contenido del tema. */
+export function looksLikeAskingMoreTopicContent(text: string): boolean {
+  const t = text.toLowerCase()
+  const mentionsMore =
+    /más contenido|mas contenido|más de este tema|mas de este tema|otra parte del tema|otro contenido|algo más de este|algo mas de este|falta por estudiar|se nos quedó|se nos quedo|necesitamos estudiar|queda algo/.test(
+      t,
+    )
+  const looksQuestion =
+    /[¿?]/.test(t) ||
+    /te gustaría|quieres (estudiar|ver|repasar)|dime si|cuéntame si|cuentame si/.test(
+      t,
+    )
+  return mentionsMore && looksQuestion
+}

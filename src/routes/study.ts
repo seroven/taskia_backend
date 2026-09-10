@@ -8,6 +8,9 @@ import {
   AppError,
   extractJson,
   formatMysqlDateTime,
+  looksLikeOfferingMorePractice,
+  requiredChatTurns,
+  soloBienCount,
   truncateChars,
 } from '../utils/helpers.js'
 import { fetchTask } from './tasks.js'
@@ -60,23 +63,31 @@ Responde SOLO JSON (sin markdown):
 context_summary ≤ 400 chars. Debe incluir SIEMPRE, si hay ejercicio abierto: "Ejercicio activo: …" con el número/datos exactos; no lo borres hasta resolverlo o cambiarlo. Resume aciertos del niño.
 user_memory_summary ≤ 600 chars (si update_user_memory=false, repite el recibido).
 exercise: usa el objeto cuando planteas un ejercicio nuevo (también en reviewing); si sigues el mismo, puedes dejar null pero conserva "Ejercicio activo" en context_summary.
-Dominio (study_eval): passed=true SOLO si TODOS se cumplen (si falta uno → passed=false):
-1) phase=reviewing (nunca en understanding ni practicing)
-2) user_turns ≥ 5 (si user_turns<5 → passed=false SIEMPRE)
-3) ≥2 aciertos reales del niño en ejercicios/variaciones distintos (números o casos distintos)
-4) al menos una variación distinta al ejemplo inicial planteado
-5) el niño explicó en corto el procedimiento O aplicó el concepto con números nuevos (no basta “sí/ok/ya/listo”)
-6) no regalaste la solución completa en esos turnos
-7) evidence debe citar en 1 frase qué demostró el niño (si no puedes citarlo → passed=false)
-Por defecto passed=false. Sé estricto: conversaciones cortas o respuestas vagas NO son dominio.
 Si study_passed_already=true → study_eval.passed=true y evidence corta "ya aprobado".
-Si passed=true, celebra en speak_to_child y di que ya puede mover la tarea a Terminado.
 Si message_source=voice: el niño habló (audio transcrito). Usa ese relato para afinar topic_summary (de qué trata el tema, ≤120 chars) y context_summary. En speak_to_child, resume en 1 frase lo que entendiste y sigue guiando; no digas que “transcribiste” ni hables de micrófonos.
 `
   if (!allowAiDraw) {
-    p += `Estudio GUIADO SIN pizarra: todo ocurre en el chat (como un tema de Mundos). Explica, pregunta y practica en el diálogo. draw_ops siempre []. No pidas dibujar ni uses la pizarra.`
+    p += `Estudio GUIADO SIN pizarra: todo ocurre en el chat. Explica, pregunta y practica en el diálogo. draw_ops siempre []. No pidas dibujar ni uses la pizarra.
+En context_summary lleva SIEMPRE "Errores: N" (N = veces que el niño se equivocó en una pregunta o idea). Si se equivoca, anota el punto débil y la siguiente pregunta refuerza ESE punto.
+Dominio (study_eval): passed=true SOLO si TODOS se cumplen (si falta uno → passed=false):
+1) phase=reviewing (nunca en understanding ni practicing)
+2) Piso de mensajes del niño: user_turns ≥ 6 + Errores. Si user_turns < 6+N → passed=false SIEMPRE. Cada error sube el piso.
+3) No basta “sí/ok/ya/listo”: tiene que haber respondido de verdad y haber reforzado los puntos débiles.
+4) no regalaste la solución completa en esos turnos
+5) evidence debe citar en 1 frase qué demostró el niño (si no puedes citarlo → passed=false)
+Por defecto passed=false. NO preguntes si quiere más ejercicios: si ya cumple el piso, celebra y dile que ya puede mover la tarea a Terminado.
+`
   } else {
     p += DRAW_OPS_PROMPT
+    p += `Dominio CON PIZARRA (study_eval.passed=true) SOLO si TODOS se cumplen:
+1) El niño resolvió 2 problemas DISTINTOS él solo: sin que le dictes la respuesta ni el paso clave, y sin errores. Si se equivoca o lo ayudas a resolverlo, ese intento NO cuenta; plantea otro para que lo intente solo.
+2) En context_summary lleva SIEMPRE "Solo bien: N/2" (N = problemas resueltos solo).
+3) Cuando N llega a 2, NO marques passed=true en ese mismo turno. Primero, con tono cálido de tutor, pregúntale si quiere practicar OTRO TIPO de ejercicio de este mismo tema (un formato distinto). En ese turno passed=false.
+4) passed=true SOLO después, si dice que no / que ya está / que no quiere más. Entonces celebra y dile que ya puede mover la tarea a Terminado.
+5) Si pide más, dale ese otro tipo (passed=false). Cuando cierre y no quiera más, passed=true (los 2 solos ya valen).
+6) phase=reviewing. evidence cita los 2 problemas que resolvió solo. Si no puedes citarlos → passed=false.
+Por defecto passed=false.
+`
   }
   return p
 }
@@ -360,13 +371,19 @@ router.post(
         ?.content ?? ''
     const boardHas = Boolean(boardDescription?.trim())
 
+    const boardMasteryHint =
+      ' Anota "Solo bien: N/2". Evalúa study_eval: 2 problemas resueltos solo; al llegar a 2 pregunta si quiere otro tipo de ejercicio (passed=false); passed=true solo si declina.'
     let instruction = allowAiDraw
       ? boardHas
-        ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes.'
-        : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
+        ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo.' +
+          boardMasteryHint +
+          ' Incluye draw_ops con clear_board + stamps/shapes.'
+        : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo.' +
+          boardMasteryHint +
+          ' Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
       : boardHas
-        ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo. Evalúa study_eval.'
-        : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo. Ignora pizarra. Evalúa study_eval.'
+        ? 'Responde breve. Usa context + last_tutor_message + mensaje + pizarra. Conserva el ejercicio activo. Anota "Errores: N". Piso user_turns ≥ 6+N. Refuerza puntos débiles. Si ya cumple el piso, puedes passed=true y celebrar Terminado (no preguntes si quiere más).'
+        : 'Responde breve. Usa context + last_tutor_message + mensaje. Conserva el ejercicio activo. Ignora pizarra. Anota "Errores: N". Piso user_turns ≥ 6+N. Refuerza puntos débiles. Si ya cumple el piso, puedes passed=true y celebrar Terminado (no preguntes si quiere más).'
     if (fromVoice) {
       instruction +=
         ' El mensaje viene de voz (transcrito): prioriza afinar topic_summary y context_summary con lo que explicó el niño.'
@@ -430,6 +447,20 @@ router.post(
     const evidence = String(
       (value.study_eval as { evidence?: string } | undefined)?.evidence ?? '',
     ).trim()
+    const speakToChild = truncateChars(
+      String(value.speak_to_child ?? '¡Genial! Cuéntame un poquito más y seguimos juntos.'),
+      MAX_SPEAK,
+    )
+    const contextSummaryDraft = String(
+      value.context_summary ?? context.context_summary,
+    )
+
+    const askQuestions = Array.isArray(value.ask_questions)
+      ? (value.ask_questions as unknown[]).map(String)
+      : []
+    const offeringMore =
+      looksLikeOfferingMorePractice(speakToChild) ||
+      askQuestions.some((q) => looksLikeOfferingMorePractice(q))
 
     // Red de seguridad: Gemini tiende a aprobar pronto; forzar criterios duros.
     let passed = Boolean(
@@ -438,20 +469,22 @@ router.post(
     if (task.study_passed) {
       passed = true
     } else {
-      if (userTurns < 5) passed = false
+      if (!allowAiDraw) {
+        if (userTurns < requiredChatTurns(6, contextSummaryDraft)) passed = false
+      }
       if (phase !== 'reviewing') passed = false
       if (!evidence) passed = false
+      if (allowAiDraw) {
+        if (offeringMore) passed = false
+        const n = soloBienCount(contextSummaryDraft)
+        if (n !== null && n < 2) passed = false
+      }
     }
 
     const reply = {
       phase,
-      speak_to_child: truncateChars(
-        String(value.speak_to_child ?? '¡Genial! Cuéntame un poquito más y seguimos juntos.'),
-        MAX_SPEAK,
-      ),
-      ask_questions: Array.isArray(value.ask_questions)
-        ? (value.ask_questions as unknown[]).map(String)
-        : [],
+      speak_to_child: speakToChild,
+      ask_questions: askQuestions,
       topic_summary: String(value.topic_summary ?? ''),
       context_summary: ensureActiveExercise(
         String(value.context_summary ?? context.context_summary),
