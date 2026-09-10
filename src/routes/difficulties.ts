@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import type { RowDataPacket } from 'mysql2'
 import { pool } from '../db/pool.js'
-import { requireAuth } from '../middleware/auth.js'
+import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
 
 const router = Router()
@@ -9,6 +9,7 @@ const router = Router()
 router.get(
   '/',
   requireAuth,
+  requireStudent,
   asyncHandler(async (_req, res) => {
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT id, code, name, sort_order FROM difficulties ORDER BY sort_order ASC, id ASC`,

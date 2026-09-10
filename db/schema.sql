@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS users (
   email VARCHAR(255) NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
   `role` ENUM('user', 'admin') NOT NULL DEFAULT 'user',
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -31,15 +32,20 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------
--- Courses (fixed dropdown for tasks)
+-- Courses (per student; admin assigns them)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS courses (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
   name VARCHAR(120) NOT NULL,
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  UNIQUE KEY uq_courses_name (name)
+  UNIQUE KEY uq_courses_user_name (user_id, name),
+  KEY idx_courses_user_id (user_id),
+  CONSTRAINT fk_courses_user
+    FOREIGN KEY (user_id) REFERENCES users (id)
+    ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------
@@ -72,7 +78,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   status ENUM('pending', 'in_progress', 'studying', 'done') NOT NULL DEFAULT 'pending',
   board_order INT NOT NULL DEFAULT 0,
   study_passed TINYINT(1) NOT NULL DEFAULT 0,
-  uses_board TINYINT(1) NOT NULL DEFAULT 1,
+  uses_board TINYINT(1) NOT NULL DEFAULT 0,
+  study_mode_chosen TINYINT(1) NOT NULL DEFAULT 0,
   due_date DATE NOT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -121,6 +128,7 @@ CREATE TABLE IF NOT EXISTS study_messages (
   task_id BIGINT UNSIGNED NOT NULL,
   role ENUM('user', 'assistant') NOT NULL,
   content TEXT NOT NULL,
+  from_voice TINYINT(1) NOT NULL DEFAULT 0,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_study_messages_task_created (task_id, created_at),
@@ -233,6 +241,7 @@ CREATE TABLE IF NOT EXISTS study_mission_messages (
   mission_id BIGINT UNSIGNED NOT NULL,
   role ENUM('user', 'assistant') NOT NULL,
   content TEXT NOT NULL,
+  from_voice TINYINT(1) NOT NULL DEFAULT 0,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_study_mission_messages_mission (mission_id, id),
@@ -327,20 +336,30 @@ CREATE TABLE IF NOT EXISTS study_challenge_presets (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------
--- Seed: courses
+-- Uso de Gemini (tokens por alumno y tipo de llamada)
 -- ---------------------------------------------------------------------------
-INSERT INTO courses (name) VALUES
-  ('Matemáticas'),
-  ('Física'),
-  ('Química'),
-  ('Programación'),
-  ('Bases de datos'),
-  ('Inglés'),
-  ('Historia'),
-  ('Estadística'),
-  ('Algoritmos'),
-  ('General') AS new_courses
-ON DUPLICATE KEY UPDATE name = new_courses.name;
+CREATE TABLE IF NOT EXISTS llm_usage (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  kind ENUM(
+    'task_tutor',
+    'mission_tutor',
+    'transcribe',
+    'challenge_generate',
+    'challenge_grade'
+  ) NOT NULL,
+  model VARCHAR(80) NOT NULL,
+  prompt_tokens INT UNSIGNED NOT NULL DEFAULT 0,
+  output_tokens INT UNSIGNED NOT NULL DEFAULT 0,
+  total_tokens INT UNSIGNED NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_llm_usage_user_created (user_id, created_at),
+  KEY idx_llm_usage_kind_created (kind, created_at),
+  CONSTRAINT fk_llm_usage_user
+    FOREIGN KEY (user_id) REFERENCES users (id)
+    ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------
 -- Seed: difficulties

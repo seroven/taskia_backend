@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { pool } from '../db/pool.js'
-import { requireAuth } from '../middleware/auth.js'
+import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
 import { callGemini, callGeminiTranscribe } from '../services/gemini.js'
 import {
@@ -74,7 +74,7 @@ Si passed=true, celebra en speak_to_child y di que ya puede mover la tarea a Ter
 Si message_source=voice: el niño habló (audio transcrito). Usa ese relato para afinar topic_summary (de qué trata el tema, ≤120 chars) y context_summary. En speak_to_child, resume en 1 frase lo que entendiste y sigue guiando; no digas que “transcribiste” ni hables de micrófonos.
 `
   if (!allowAiDraw) {
-    p += 'draw_ops siempre []. No dibujes en la pizarra.'
+    p += `Estudio GUIADO SIN pizarra: todo ocurre en el chat (como un tema de Mundos). Explica, pregunta y practica en el diálogo. draw_ops siempre []. No pidas dibujar ni uses la pizarra.`
   } else {
     p += DRAW_OPS_PROMPT
   }
@@ -156,14 +156,30 @@ async function saveBoard(taskId: number, board: unknown) {
   )
 }
 
-async function insertMessage(taskId: number, role: string, content: string) {
-  const [result] = await pool.query<ResultSetHeader>(
-    `INSERT INTO study_messages (task_id, role, content) VALUES (?, ?, ?)`,
-    [taskId, role, content],
-  )
+async function insertMessage(
+  taskId: number,
+  role: string,
+  content: string,
+  fromVoice = false,
+) {
+  let insertId = 0
+  try {
+    const [result] = await pool.query<ResultSetHeader>(
+      `INSERT INTO study_messages (task_id, role, content, from_voice)
+       VALUES (?, ?, ?, ?)`,
+      [taskId, role, content, fromVoice ? 1 : 0],
+    )
+    insertId = result.insertId
+  } catch {
+    const [result] = await pool.query<ResultSetHeader>(
+      `INSERT INTO study_messages (task_id, role, content) VALUES (?, ?, ?)`,
+      [taskId, role, content],
+    )
+    insertId = result.insertId
+  }
   const [rows] = await pool.query<RowDataPacket[]>(
     'SELECT created_at FROM study_messages WHERE id = ?',
-    [result.insertId],
+    [insertId],
   )
   return {
     role,
@@ -235,6 +251,7 @@ function ensureActiveExercise(
 }
 
 router.use(requireAuth)
+router.use(requireStudent)
 
 const MAX_VOICE_SECONDS = 90
 
@@ -254,6 +271,7 @@ router.post(
       audioBase64,
       mimeType,
       durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : undefined,
+      usage: { userId: req.user!.id, kind: 'transcribe' },
     })
 
     res.json(result)
@@ -331,7 +349,7 @@ router.post(
 
     const context = await loadContext(taskId)
     const userMemory = await loadUserMemory(userId)
-    context.messages.push(await insertMessage(taskId, 'user', message))
+    context.messages.push(await insertMessage(taskId, 'user', message, fromVoice))
     const userTurns = context.messages.filter((m) => m.role === 'user').length
     const updateUserMemory = userTurns % 3 === 0
 
@@ -385,6 +403,7 @@ router.post(
       system: tutorSystemPrompt(allowAiDraw),
       user: JSON.stringify(payload),
       boardImageBase64: boardHas ? boardImageBase64 : null,
+      usage: { userId, kind: 'task_tutor' },
     })
 
     let value: Record<string, unknown>

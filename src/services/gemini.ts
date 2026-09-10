@@ -1,10 +1,24 @@
 import { env } from '../config/env.js'
+import { pool } from '../db/pool.js'
 import { AppError } from '../utils/helpers.js'
+
+export type LlmUsageKind =
+  | 'task_tutor'
+  | 'mission_tutor'
+  | 'transcribe'
+  | 'challenge_generate'
+  | 'challenge_grade'
+
+export interface LlmUsageContext {
+  userId: number
+  kind: LlmUsageKind
+}
 
 export async function callGemini(opts: {
   system: string
   user: string
   boardImageBase64?: string | null
+  usage?: LlmUsageContext
 }): Promise<string> {
   const apiKey = env.gemini.apiKey.trim().replace(/^["']|["']$/g, '')
   if (!apiKey) throw new AppError('Configura GEMINI_API_KEY en el archivo .env')
@@ -34,15 +48,17 @@ export async function callGemini(opts: {
     generationConfig.temperature = 0.6
   }
 
-  return (
-    await generateGeminiText({
-      apiKey,
-      model,
-      system: opts.system,
-      parts,
-      generationConfig,
-    })
-  ).text
+  const generated = await generateGeminiText({
+    apiKey,
+    model,
+    system: opts.system,
+    parts,
+    generationConfig,
+  })
+  if (opts.usage) {
+    void recordLlmUsage(opts.usage, model, generated.usage)
+  }
+  return generated.text
 }
 
 const TRANSCRIBE_SYSTEM = `Eres un transcriptor fiel para una app de estudio infantil (español latinoamericano).
@@ -65,6 +81,7 @@ export async function callGeminiTranscribe(opts: {
   audioBase64: string
   mimeType: string
   durationSeconds?: number
+  usage?: LlmUsageContext
 }): Promise<{ text: string; truncated: boolean }> {
   const apiKey = env.gemini.apiKey.trim().replace(/^["']|["']$/g, '')
   if (!apiKey) throw new AppError('Configura GEMINI_API_KEY en el archivo .env')
@@ -117,7 +134,7 @@ export async function callGeminiTranscribe(opts: {
     },
   ]
 
-  const { text, finishReason } = await generateGeminiText({
+  const { text, finishReason, usage } = await generateGeminiText({
     apiKey,
     model,
     system: TRANSCRIBE_SYSTEM,
@@ -128,6 +145,9 @@ export async function callGeminiTranscribe(opts: {
       temperature: 0.1,
     },
   })
+  if (opts.usage) {
+    void recordLlmUsage(opts.usage, model, usage)
+  }
 
   const cleaned = text
     .replace(/^```(?:\w+)?\s*/i, '')
@@ -146,7 +166,11 @@ async function generateGeminiText(opts: {
   system: string
   parts: Array<Record<string, unknown>>
   generationConfig: Record<string, unknown>
-}): Promise<{ text: string; finishReason?: string }> {
+}): Promise<{
+  text: string
+  finishReason?: string
+  usage: { prompt: number; output: number; total: number }
+}> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${opts.model}:generateContent?key=${opts.apiKey}`
   const response = await fetch(url, {
     method: 'POST',
@@ -177,5 +201,43 @@ async function generateGeminiText(opts: {
     .map((p) => p.text!.trim())
   const joined = texts.join('\n').trim()
   if (!joined) throw new AppError('Gemini no devolvió texto útil')
-  return { text: joined, finishReason: candidate?.finishReason }
+  const meta = payload.usageMetadata as
+    | {
+        promptTokenCount?: number
+        candidatesTokenCount?: number
+        totalTokenCount?: number
+      }
+    | undefined
+  const prompt = Number(meta?.promptTokenCount ?? 0)
+  const output = Number(meta?.candidatesTokenCount ?? 0)
+  const total = Number(meta?.totalTokenCount ?? prompt + output)
+  return {
+    text: joined,
+    finishReason: candidate?.finishReason,
+    usage: { prompt, output, total },
+  }
+}
+
+async function recordLlmUsage(
+  ctx: LlmUsageContext,
+  model: string,
+  usage: { prompt: number; output: number; total: number },
+) {
+  try {
+    await pool.query(
+      `INSERT INTO llm_usage
+         (user_id, kind, model, prompt_tokens, output_tokens, total_tokens)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        ctx.userId,
+        ctx.kind,
+        model,
+        Math.max(0, usage.prompt),
+        Math.max(0, usage.output),
+        Math.max(0, usage.total),
+      ],
+    )
+  } catch {
+    /* la tabla puede no existir aún; no cortar la sesión del niño */
+  }
 }

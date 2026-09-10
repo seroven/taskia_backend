@@ -57,11 +57,32 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
     const payload: JwtPayload = { sub: decoded.sub, role: decoded.role }
 
     const [rows] = await pool.query<
-      Array<{ id: number; username: string; email: string; role: UserRole }> & import('mysql2').RowDataPacket[]
-    >('SELECT id, username, email, role FROM users WHERE id = ? LIMIT 1', [payload.sub])
+      Array<{
+        id: number
+        username: string
+        email: string
+        role: UserRole
+        is_active: number
+      }> &
+        import('mysql2').RowDataPacket[]
+    >(
+      'SELECT id, username, email, role, is_active FROM users WHERE id = ? LIMIT 1',
+      [payload.sub],
+    )
 
-    const user = (rows as unknown as Array<{ id: number; username: string; email: string; role: UserRole }>)[0]
+    const user = (
+      rows as unknown as Array<{
+        id: number
+        username: string
+        email: string
+        role: UserRole
+        is_active: number
+      }>
+    )[0]
     if (!user) throw new AppError('Debes iniciar sesión', 401)
+    if (Number(user.is_active) === 0) {
+      throw new AppError('Tu cuenta está pausada. Pídele ayuda a un adulto.', 403)
+    }
 
     req.user = {
       id: Number(user.id),
@@ -75,13 +96,25 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
   }
 }
 
-export function requireUserRole(req: Request, _res: Response, next: NextFunction) {
+export function requireStudent(req: Request, _res: Response, next: NextFunction) {
   if (!req.user) {
     next(new AppError('Debes iniciar sesión', 401))
     return
   }
-  if (req.user.role !== 'user' && req.user.role !== 'admin') {
-    next(new AppError('No autorizado', 403))
+  if (req.user.role !== 'user') {
+    next(new AppError('Esta zona es solo para alumnos', 403))
+    return
+  }
+  next()
+}
+
+export function requireAdmin(req: Request, _res: Response, next: NextFunction) {
+  if (!req.user) {
+    next(new AppError('Debes iniciar sesión', 401))
+    return
+  }
+  if (req.user.role !== 'admin') {
+    next(new AppError('Solo el administrador puede entrar aquí', 403))
     return
   }
   next()

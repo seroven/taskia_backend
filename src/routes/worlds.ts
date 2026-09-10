@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { pool } from '../db/pool.js'
-import { requireAuth } from '../middleware/auth.js'
+import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
 import { callGemini } from '../services/gemini.js'
 import {
@@ -69,6 +69,14 @@ function mapChallenge(r: RowDataPacket) {
     scope: r.scope as string,
     mission_id: r.mission_id == null ? null : Number(r.mission_id),
     course_id: r.course_id == null ? null : Number(r.course_id),
+    course_name:
+      r.course_name == null || r.course_name === ''
+        ? null
+        : String(r.course_name),
+    mission_title:
+      r.mission_title == null || r.mission_title === ''
+        ? null
+        : String(r.mission_title),
     difficulty: r.difficulty as string,
     question_count: Number(r.question_count),
     status: r.status as string,
@@ -101,10 +109,17 @@ async function fetchMission(missionId: number, userId: number) {
 
 async function listWorldCourses(worldId: number) {
   const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT wc.world_id, wc.course_id, c.name AS course_name, wc.sort_order
+    `SELECT wc.world_id, wc.course_id, c.name AS course_name, wc.sort_order,
+            COUNT(m.id) AS mission_count,
+            COALESCE(SUM(m.status = 'mastered'), 0) AS mastered_count,
+            COALESCE(SUM(m.status = 'studying'), 0) AS studying_count,
+            COALESCE(SUM(m.status = 'pending'), 0) AS pending_count
      FROM study_world_courses wc
      INNER JOIN courses c ON c.id = wc.course_id
+     LEFT JOIN study_missions m
+       ON m.world_id = wc.world_id AND m.course_id = wc.course_id
      WHERE wc.world_id = ?
+     GROUP BY wc.world_id, wc.course_id, c.name, wc.sort_order
      ORDER BY wc.sort_order ASC, c.name ASC`,
     [worldId],
   )
@@ -113,6 +128,10 @@ async function listWorldCourses(worldId: number) {
     course_id: Number(r.course_id),
     course_name: r.course_name as string,
     sort_order: Number(r.sort_order),
+    mission_count: Number(r.mission_count) || 0,
+    mastered_count: Number(r.mastered_count) || 0,
+    studying_count: Number(r.studying_count) || 0,
+    pending_count: Number(r.pending_count) || 0,
   }))
 }
 
@@ -197,15 +216,27 @@ async function insertMissionMessage(
   missionId: number,
   role: string,
   content: string,
+  fromVoice = false,
 ) {
-  const [result] = await pool.query<ResultSetHeader>(
-    `INSERT INTO study_mission_messages (mission_id, role, content)
-     VALUES (?, ?, ?)`,
-    [missionId, role, content],
-  )
+  let insertId = 0
+  try {
+    const [result] = await pool.query<ResultSetHeader>(
+      `INSERT INTO study_mission_messages (mission_id, role, content, from_voice)
+       VALUES (?, ?, ?, ?)`,
+      [missionId, role, content, fromVoice ? 1 : 0],
+    )
+    insertId = result.insertId
+  } catch {
+    const [result] = await pool.query<ResultSetHeader>(
+      `INSERT INTO study_mission_messages (mission_id, role, content)
+       VALUES (?, ?, ?)`,
+      [missionId, role, content],
+    )
+    insertId = result.insertId
+  }
   const [rows] = await pool.query<RowDataPacket[]>(
     'SELECT created_at FROM study_mission_messages WHERE id = ? LIMIT 1',
-    [result.insertId],
+    [insertId],
   )
   return {
     role,
@@ -227,18 +258,34 @@ Ejemplo (triángulo base 8 altura 4):
 
 function missionTutorPrompt(allowAiDraw: boolean): string {
   let p = `Tutor amable para niño ~10 años. Español latinoamericano, claro y breve.
-Enseñas un TEMA (misión), no una tarea escolar concreta. Guía con preguntas/pistas; no des la solución completa.
+Enseñas un TEMA completo (misión), no una tarea escolar suelta. Guía con preguntas/pistas; no des la solución completa.
 Recibes context_summary, last_tutor_message. Conserva coherencia con el ejercicio/ejemplo abierto.
 Pizarra de entrada: si board_has_drawing=false, ignora lo que haya dibujado el niño.
 Responde SOLO JSON (sin markdown):
 {"phase":"understanding|practicing|reviewing","speak_to_child":"...","ask_questions":[],"topic_summary":"...","context_summary":"...","draw_ops":[],"hints_level":0,"study_eval":{"passed":false,"evidence":""}}
-context_summary ≤ 400 chars; incluye "Ejercicio activo: …" si hay práctica abierta.
-Dominio (study_eval.passed=true) solo si phase=reviewing, ≥2 aciertos reales, variación distinta, user_turns≥3.
-Si mastered_already=true → passed=true.
+context_summary ≤ 400 chars; incluye "Ejercicio activo: …" si hay práctica abierta. Anota qué partes del tema ya cubrió el niño y cuáles faltan.
+
+RECORRIDO OBLIGATORIO del tema (no saltes etapas):
+1) Básico: nombres, definiciones, hechos claros del título/descripción y de lo que el niño contó.
+2) Comprensión: que lo explique con sus palabras (qué, quién, cuándo, para qué).
+3) Observación: preguntas que exigen fijarse en detalles (orden de hechos, diferencias, causas, “¿qué pasaría si…?”, un ejemplo propio, un detalle que mencionó antes).
+Cubre el tema ENTERO. Si el material tiene varias ideas, recórrelas; no apruebes por un solo fragmento bien dicho.
+
+Dominio (study_eval.passed=true) SOLO si TODOS se cumplen. Si falta uno → passed=false:
+1) phase=reviewing (nunca en understanding ni practicing)
+2) user_turns ≥ 7
+3) ≥3 aciertos reales (no “sí/ok/ya/listo”), en ideas DISTINTAS del tema
+4) al menos 1 acierto básico Y al menos 2 aciertos de observación/aplicación
+5) el niño pudo explicar el tema de punta a punta (las ideas principales, no un dato suelto)
+6) no regalaste las respuestas completas en esos turnos
+7) evidence cita en 1–2 frases QUÉ demostró y qué partes del tema cubrió; si no puedes citarlo → passed=false
+Por defecto passed=false. Sé MUY estricto: un tema corto mal explicado o solo preguntas fáciles NO es dominio al 100%.
+Si mastered_already=true → passed=true y evidence "ya dominado".
+Si passed=true, celebra en speak_to_child y di que ya dominó el tema.
 Si message_source=voice: el niño habló (audio transcrito). Usa ese relato para afinar topic_summary (de qué trata el tema) y context_summary. En speak_to_child, resume en 1 frase lo que entendiste y sigue guiando; no menciones micrófonos ni transcripción.
 `
   if (!allowAiDraw) {
-    p += 'draw_ops siempre []. No dibujes en la pizarra.'
+    p += 'draw_ops siempre []. No dibujes en la pizarra. Todo el recorrido (básico + observación) ocurre en el chat.'
   } else {
     p += MISSION_DRAW_OPS_PROMPT
   }
@@ -295,8 +342,10 @@ async function missionsForChallenge(
     const [rows] = await pool.query<RowDataPacket[]>(
       `${MISSION_SELECT}
        INNER JOIN study_worlds w ON w.id = m.world_id
+       LEFT JOIN study_world_courses wc
+         ON wc.world_id = m.world_id AND wc.course_id = m.course_id
        WHERE m.world_id = ? AND w.user_id = ?
-       ORDER BY m.course_id ASC, m.sort_order ASC`,
+       ORDER BY wc.sort_order ASC, c.name ASC, m.sort_order ASC`,
       [worldId, userId],
     )
     const list = rows.map(mapMission)
@@ -340,10 +389,68 @@ async function loadMissionStudyMaterial(missionId: number) {
   }
 }
 
+type MissionRow = ReturnType<typeof mapMission>
+
+function shuffleArray<T>(items: T[]): T[] {
+  const next = [...items]
+  for (let i = next.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1))
+    const tmp = next[i]!
+    next[i] = next[j]!
+    next[j] = tmp
+  }
+  return next
+}
+
+function groupMissionsByCourse(missions: MissionRow[]) {
+  const groups: Array<{
+    course_id: number
+    course_name: string
+    missions: MissionRow[]
+  }> = []
+  const index = new Map<number, (typeof groups)[number]>()
+  for (const mission of missions) {
+    let group = index.get(mission.course_id)
+    if (!group) {
+      group = {
+        course_id: mission.course_id,
+        course_name: mission.course_name,
+        missions: [],
+      }
+      index.set(mission.course_id, group)
+      groups.push(group)
+    }
+    group.missions.push(mission)
+  }
+  return groups
+}
+
+function distributeQuestionCounts(weights: number[], total: number): number[] {
+  const sum = weights.reduce((acc, n) => acc + n, 0)
+  if (sum <= 0 || total <= 0) return weights.map(() => 0)
+  const raw = weights.map((w) => (total * w) / sum)
+  const counts = raw.map((n) => Math.floor(n))
+  let leftover = total - counts.reduce((acc, n) => acc + n, 0)
+  const order = raw
+    .map((n, i) => ({ i, frac: n - Math.floor(n) }))
+    .sort((a, b) => b.frac - a.frac)
+  for (const item of order) {
+    if (leftover <= 0) break
+    counts[item.i] += 1
+    leftover -= 1
+  }
+  return counts
+}
+
 async function generateQuestionsBatch(
-  missions: ReturnType<typeof mapMission>[],
+  missions: MissionRow[],
   count: number,
   batchOffset: number,
+  options: {
+    scope: string
+    avoidPrompts?: string[]
+    userId: number
+  },
 ) {
   const catalog = []
   for (const m of missions) {
@@ -361,6 +468,13 @@ async function generateQuestionsBatch(
     })
   }
 
+  const mixRule =
+    options.scope === 'course'
+      ? `- Alcance MATERIA: mezcla las misiones. NO agrupes por “tema 1, tema 2”. Intercala preguntas de distintos temas.`
+      : options.scope === 'world'
+        ? `- Alcance MUNDO: estas misiones son de UNA sola materia. Mezcla los temas DENTRO de esta materia.`
+        : `- Alcance TEMA: todas las preguntas son de esta misión.`
+
   const system = `Generas preguntas de desafío para niños ~10 años. Español latinoamericano neutro.
 NO enseñes: solo preguntas evaluables. Responde SOLO un JSON array (sin markdown).
 
@@ -371,12 +485,14 @@ REGLA DE CONTENIDO (la más importante):
 - Si studied_text está vacío o es muy corto, limita las preguntas a lo poco que sí esté en description/topic_summary/context_summary. No inventes batallas, fechas o personajes extras.
 - Las opciones incorrectas de multiple_choice pueden ser plausibles, pero la respuesta correcta DEBE basarse en el material estudiado.
 
-SUFICIENCIA DEL MATERIAL (obligatorio):
-- Primero evalúa cuántas preguntas DISTINTAS y justas se pueden hacer con el material real (sin repetir la misma idea con otras palabras).
-- "count" es un MÁXIMO pedido, no una meta a rellenar. Si el material solo sostiene 4–8 preguntas, devolvé esas; NUNCA inventes para llegar a 20, 40 u 80.
-- Un tema corto o poco estudiado NO es un examen largo. Prefiere pocas preguntas claras a muchas inventadas.
-- Si ya no hay hechos nuevos, DETENTE y devolvé menos ítems. Un array más corto es correcto y preferible.
-- No reformules la misma pregunta. Cada ítem debe evaluar un hecho o idea distinta del material.
+CUOTA (obligatorio):
+- El objetivo es generar ${count} preguntas DISTINTAS. Intenta LLEGAR a esa cantidad.
+- Cubre todos los hechos útiles del material: personas, lugares, fechas, causas, consecuencias, ejemplos, definiciones, orden de eventos.
+- Cambia el ángulo o el formato (opción múltiple, texto corto, completar) para aprovechar el mismo material SIN repetir ni parafrasear la misma pregunta.
+- Solo devolvé MENOS de ${count} si de verdad ya no queda ningún hecho o detalle distinto. Un recorte grande está mal si el material aún da para más.
+- NUNCA inventes datos que no estén en el material para rellenar (p. ej. no armes un examen de 80 con dos temas cortos).
+
+${mixRule}
 
 Formato EXACTO de cada ítem:
 {
@@ -396,21 +512,25 @@ Reglas de tipo:
    - answer_key = solo "A"|"B"|"C"|"D" (A=primera opción).
    - Nunca options=null ni [].
 4) Si kind="short_text" o "fill_blank": options=null; answer_key=respuesta breve tomada del material.
-5) Devolvé como máximo ${count} preguntas (pueden ser menos). mission_id debe existir en la lista.
-6) Mezcla tipos cuando uses_board=false (incluye varias multiple_choice) SOLO si hay material suficiente.
-7) Si hay poco material, haz pocas preguntas simples sobre ese mismo material; no rellenes con trivia externa.
+5) Devolvé como máximo ${count} preguntas. mission_id debe existir en la lista.
+6) Mezcla tipos cuando uses_board=false (incluye varias multiple_choice) si hay material suficiente.
 
 Ejemplo (solo válido si esos datos están en studied_text):
 {"mission_id":1,"kind":"multiple_choice","prompt":"Según lo que estudiaste, ¿quién llegó desde el sur?","options":["José de San Martín","Simón Bolívar","Francisco Pizarro","Tupac Amaru"],"answer_key":"A","requires_board":false}`
 
   const user = JSON.stringify({
-    max_count: count,
+    target_count: count,
     batch_offset: batchOffset,
+    already_asked: options.avoidPrompts ?? [],
     missions: catalog,
-    instruction: `Genera HASTA ${count} preguntas nuevas (pueden ser menos). ÚNICAMENTE con base en studied_text / topic_summary / context_summary / description. Si el material no alcanza para ${count} preguntas distintas y justas, devolvé solo las que sí se puedan sostener. No inventes para completar el cupo.`,
+    instruction: `Genera ${count} preguntas nuevas, distintas entre sí y distintas de already_asked. ÚNICAMENTE con base en studied_text / topic_summary / context_summary / description. Esfuérzate por llegar a ${count} cubriendo hechos diferentes. Solo entrega menos si el material ya no alcanza para una pregunta nueva y justa.`,
   })
 
-  const raw = await callGemini({ system, user })
+  const raw = await callGemini({
+    system,
+    user,
+    usage: { userId: options.userId, kind: 'challenge_generate' },
+  })
   console.log('[challenge:generate] raw Gemini response:\n', raw)
   const jsonText = extractJson(raw)
   let value: unknown
@@ -429,6 +549,46 @@ Ejemplo (solo válido si esos datos están en studied_text):
     throw new AppError('Gemini no devolvió un array de preguntas')
   }
   return value as Array<Record<string, unknown>>
+}
+
+async function generateQuestionsUpTo(
+  missions: MissionRow[],
+  count: number,
+  scope: string,
+  userId: number,
+): Promise<Array<Record<string, unknown>>> {
+  if (count <= 0 || missions.length === 0) return []
+  const collected: Array<Record<string, unknown>> = []
+  const seen = new Set<string>()
+  let emptyStreak = 0
+
+  const takeNew = (part: Array<Record<string, unknown>>) => {
+    let added = 0
+    for (const item of part) {
+      const prompt =
+        typeof item.prompt === 'string' ? item.prompt.trim().toLowerCase() : ''
+      if (!prompt || seen.has(prompt)) continue
+      seen.add(prompt)
+      collected.push(item)
+      added += 1
+      if (collected.length >= count) break
+    }
+    return added
+  }
+
+  while (collected.length < count && emptyStreak < 2) {
+    const need = Math.min(12, count - collected.length)
+    const part = await generateQuestionsBatch(missions, need, collected.length, {
+      scope,
+      avoidPrompts: [...seen],
+      userId,
+    })
+    const added = takeNew(part)
+    if (added === 0) emptyStreak += 1
+    else emptyStreak = 0
+  }
+
+  return collected.slice(0, count)
 }
 
 /** Tope duro según riqueza del material: evita exámenes enormes con poco estudio. */
@@ -454,14 +614,14 @@ function estimateMaxQuestionsFromMaterial(
   }
 
   if (withBody === 0) {
-    // Solo títulos/descripciones muy pobres: pocas preguntas como máximo
     return Math.min(requested, 3)
   }
 
-  // ~1 pregunta por ~110 caracteres de material útil, con piso suave por misión
-  const fromChars = Math.max(withBody, Math.floor(chars / 110))
-  const capped = Math.min(requested, fromChars)
-  return Math.max(1, Math.min(requested, capped))
+  // Más generoso: varios ángulos por hecho, sin abrir la puerta a 80 preguntas con poco texto.
+  const fromChars = Math.floor(chars / 40)
+  const fromMissions = withBody * 8
+  const estimated = Math.max(fromChars, fromMissions)
+  return Math.max(1, Math.min(requested, estimated))
 }
 
 /** mysql2 puede devolver JSON ya parseado; Gemini a veces manda shapes raros. */
@@ -529,7 +689,7 @@ function normalizeAnswerKey(
   return raw || 'A'
 }
 
-async function getChallengeDetail(challengeId: number, userId: number) {
+export async function getChallengeDetail(challengeId: number, userId: number) {
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT id, user_id, world_id, scope, mission_id, course_id, difficulty,
             question_count, status, score, started_at, completed_at
@@ -544,9 +704,12 @@ async function getChallengeDetail(challengeId: number, userId: number) {
   const [qrows] = await pool.query<RowDataPacket[]>(
     `SELECT q.id, q.mission_id, q.sort_order, q.kind, q.prompt, q.options_json,
             q.answer_key, q.requires_board,
-            a.is_correct, a.user_answer
+            a.is_correct, a.user_answer,
+            m.course_id, c.name AS course_name
      FROM study_challenge_questions q
      LEFT JOIN study_challenge_answers a ON a.question_id = q.id
+     LEFT JOIN study_missions m ON m.id = q.mission_id
+     LEFT JOIN courses c ON c.id = m.course_id
      WHERE q.challenge_id = ?
      ORDER BY q.sort_order ASC, q.id ASC`,
     [challengeId],
@@ -570,6 +733,8 @@ async function getChallengeDetail(challengeId: number, userId: number) {
     const base = {
       id: Number(q.id),
       mission_id: q.mission_id == null ? null : Number(q.mission_id),
+      course_id: q.course_id == null ? null : Number(q.course_id),
+      course_name: q.course_name == null ? null : String(q.course_name),
       sort_order: Number(q.sort_order),
       kind,
       prompt: q.prompt as string,
@@ -638,6 +803,7 @@ async function gradeOpenAnswersBatch(
     requires_board: boolean
     board_json_snip: string
   }>,
+  userId: number,
 ): Promise<Map<number, boolean>> {
   const results = new Map<number, boolean>()
   if (items.length === 0) return results
@@ -649,6 +815,7 @@ Responde SOLO un JSON array:
 [{"question_id":1,"correct":true|false}]
 Debes incluir exactamente un objeto por cada pregunta recibida.`,
     user: JSON.stringify({ items }),
+    usage: { userId, kind: 'challenge_grade' },
   })
   console.log('[challenge:grade-batch] raw Gemini response:\n', raw)
 
@@ -678,6 +845,7 @@ Debes incluir exactamente un objeto por cada pregunta recibida.`,
 }
 
 router.use(requireAuth)
+router.use(requireStudent)
 
 // ---------------------------------------------------------------------------
 // Static / nested paths (before /:worldId)
@@ -758,7 +926,7 @@ router.get(
     if (context.messages.length === 0) {
       const speak = `¡Hola! Vamos a estudiar "${mission.title}"${
         mission.uses_board ? ' (puedes usar la pizarra)' : ''
-      }. Cuéntame qué sabes o qué te confunde y lo vemos juntos.`
+      }. Empezamos por lo básico y luego te haré preguntas para fijarte bien en los detalles. Cuéntame qué sabes o qué te confunde.`
       context.topic_summary = mission.title
       context.context_summary = `Inicio local. Misión: "${mission.title}".`
       try {
@@ -812,7 +980,12 @@ router.post(
       Boolean(req.body.allow_ai_draw) && mission.uses_board
     const fromVoice = Boolean(req.body.from_voice)
     const context = await loadMissionContext(missionId)
-    const userMsg = await insertMissionMessage(missionId, 'user', message)
+    const userMsg = await insertMissionMessage(
+      missionId,
+      'user',
+      message,
+      fromVoice,
+    )
     context.messages.push(userMsg)
     const userTurns = context.messages.filter((m) => m.role === 'user').length
 
@@ -830,8 +1003,8 @@ router.post(
     const boardHas = Boolean(boardDescription?.trim())
 
     let instruction = allowAiDraw
-      ? 'Responde breve. Enseña el tema. Conserva ejercicio activo. Evalúa study_eval. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
-      : 'Responde breve. Enseña el tema. Conserva ejercicio activo. Evalúa study_eval.'
+      ? 'Responde breve. Enseña el tema completo (básico + observación). Conserva ejercicio activo. Evalúa study_eval con criterio estricto. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
+      : 'Responde breve. Enseña el tema completo (básico + observación). Conserva ejercicio activo. Evalúa study_eval con criterio estricto. Sin pizarra.'
     if (fromVoice) {
       instruction +=
         ' El mensaje viene de voz (transcrito): prioriza afinar topic_summary y context_summary con lo que explicó el niño.'
@@ -867,6 +1040,7 @@ router.post(
       boardImageBase64: boardHas
         ? (req.body.board_image_base64 as string | null | undefined) ?? null
         : null,
+      usage: { userId, kind: 'mission_tutor' },
     })
 
     let value: Record<string, unknown>
@@ -911,7 +1085,9 @@ router.post(
       },
     }
 
-    if (userTurns < 3) reply.study_eval.passed = false
+    if (userTurns < 7) reply.study_eval.passed = false
+    if (reply.phase !== 'reviewing') reply.study_eval.passed = false
+    if (!reply.study_eval.evidence.trim()) reply.study_eval.passed = false
     if (mission.status === 'mastered') reply.study_eval.passed = true
 
     let visible = reply.speak_to_child
@@ -1030,18 +1206,30 @@ router.post(
 
     let generated: Array<Record<string, unknown>> = []
     try {
-      if (total <= 15) {
-        generated = await generateQuestionsBatch(missions, total, 0)
-      } else {
-        let offset = 0
-        while (offset < total) {
-          const batch = Math.min(10, total - offset)
-          const part = await generateQuestionsBatch(missions, batch, offset)
-          generated.push(...part)
-          // El modelo devolvió menos: el material ya no alcanza
-          if (part.length < batch) break
-          offset += batch
+      if (scope === 'world') {
+        const groups = groupMissionsByCourse(missions)
+        const counts = distributeQuestionCounts(
+          groups.map((g) => g.missions.length),
+          total,
+        )
+        for (let i = 0; i < groups.length; i += 1) {
+          const group = groups[i]!
+          const need = counts[i] ?? 0
+          if (need <= 0) continue
+          const part = await generateQuestionsUpTo(
+            group.missions,
+            need,
+            'world',
+            userId,
+          )
+          generated.push(...shuffleArray(part))
         }
+      } else if (scope === 'course') {
+        generated = shuffleArray(
+          await generateQuestionsUpTo(missions, total, 'course', userId),
+        )
+      } else {
+        generated = await generateQuestionsUpTo(missions, total, 'mission', userId)
       }
     } catch (err) {
       await pool.query('DELETE FROM study_challenges WHERE id = ?', [
@@ -1267,7 +1455,7 @@ router.post(
       }
     }
 
-    const openGrades = await gradeOpenAnswersBatch(openItems)
+    const openGrades = await gradeOpenAnswersBatch(openItems, userId)
     for (const [qid, correct] of openGrades) graded.set(qid, correct)
 
     // Limpia respuestas previas (por si reintento) y guarda todo de una vez
@@ -1402,8 +1590,8 @@ router.post(
     await requireWorld(worldId, userId)
 
     const [existsRows] = await pool.query<RowDataPacket[]>(
-      'SELECT COUNT(*) AS c FROM courses WHERE id = ? AND is_active = 1',
-      [courseId],
+      'SELECT COUNT(*) AS c FROM courses WHERE id = ? AND user_id = ? AND is_active = 1',
+      [courseId, userId],
     )
     if (Number(existsRows[0]?.c) === 0) throw new AppError('Curso no válido')
 
@@ -1593,21 +1781,26 @@ router.get(
       : undefined
 
     let sql = `
-      SELECT id, user_id, world_id, scope, mission_id, course_id, difficulty,
-             question_count, status, score, started_at, completed_at
-      FROM study_challenges
-      WHERE world_id = ? AND user_id = ? AND status = 'completed'
+      SELECT ch.id, ch.user_id, ch.world_id, ch.scope, ch.mission_id, ch.course_id,
+             ch.difficulty, ch.question_count, ch.status, ch.score,
+             ch.started_at, ch.completed_at,
+             c.name AS course_name,
+             m.title AS mission_title
+      FROM study_challenges ch
+      LEFT JOIN courses c ON c.id = ch.course_id
+      LEFT JOIN study_missions m ON m.id = ch.mission_id
+      WHERE ch.world_id = ? AND ch.user_id = ? AND ch.status = 'completed'
     `
     const params: unknown[] = [worldId, userId]
 
     if (missionId != null && Number.isFinite(missionId)) {
-      sql += ' AND mission_id = ?'
+      sql += ' AND ch.mission_id = ?'
       params.push(missionId)
     } else if (courseId != null && Number.isFinite(courseId)) {
-      sql += ' AND (course_id = ? OR (scope = \'course\' AND course_id = ?))'
+      sql += ' AND (ch.course_id = ? OR (ch.scope = \'course\' AND ch.course_id = ?))'
       params.push(courseId, courseId)
     }
-    sql += ' ORDER BY completed_at DESC, id DESC LIMIT 50'
+    sql += ' ORDER BY ch.completed_at DESC, ch.id DESC LIMIT 50'
 
     const [rows] = await pool.query<RowDataPacket[]>(sql, params)
     res.json(rows.map(mapChallenge))

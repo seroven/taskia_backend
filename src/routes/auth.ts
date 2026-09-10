@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import type { RowDataPacket, ResultSetHeader } from 'mysql2'
+import type { RowDataPacket } from 'mysql2'
 import { pool } from '../db/pool.js'
 import {
   clearAuthCookie,
@@ -25,41 +25,8 @@ function validateCredentials(username: string, password: string, email?: string)
 
 router.post(
   '/register',
-  asyncHandler(async (req, res) => {
-    const username = String(req.body.username ?? '')
-    const email = String(req.body.email ?? '')
-    const password = String(req.body.password ?? '')
-    validateCredentials(username, password, email)
-
-    const u = username.trim()
-    const e = email.trim().toLowerCase()
-
-    const [existingUser] = await pool.query<RowDataPacket[]>(
-      'SELECT id FROM users WHERE username = ? LIMIT 1',
-      [u],
-    )
-    if (existingUser.length > 0) throw new AppError('Ese nombre de usuario ya existe')
-
-    const [existingEmail] = await pool.query<RowDataPacket[]>(
-      'SELECT id FROM users WHERE email = ? LIMIT 1',
-      [e],
-    )
-    if (existingEmail.length > 0) throw new AppError('Ese correo ya está registrado')
-
-    const passwordHash = await bcrypt.hash(password, 10)
-    const [result] = await pool.query<ResultSetHeader>(
-      `INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, 'user')`,
-      [u, e, passwordHash],
-    )
-
-    const user: PublicUser = {
-      id: result.insertId,
-      username: u,
-      email: e,
-      role: 'user',
-    }
-    setAuthCookie(res, signToken(user))
-    res.json(user)
+  asyncHandler(async () => {
+    throw new AppError('Las cuentas las crea un adulto. Pídele que te registre.', 403)
   }),
 )
 
@@ -71,7 +38,7 @@ router.post(
     validateCredentials(username, password)
 
     const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT id, username, email, password_hash, role FROM users WHERE username = ? LIMIT 1',
+      'SELECT id, username, email, password_hash, role, is_active FROM users WHERE username = ? LIMIT 1',
       [username.trim()],
     )
     const row = rows[0]
@@ -79,6 +46,9 @@ router.post(
 
     const valid = await bcrypt.compare(password, row.password_hash as string)
     if (!valid) throw new AppError('Usuario o contraseña incorrectos')
+    if (Number(row.is_active) === 0) {
+      throw new AppError('Tu cuenta está pausada. Pídele ayuda a un adulto.')
+    }
 
     const user: PublicUser = {
       id: Number(row.id),
@@ -104,6 +74,72 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     res.json(req.user ?? null)
+  }),
+)
+
+router.patch(
+  '/me',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const current = req.user!
+    const username =
+      req.body.username === undefined
+        ? current.username
+        : String(req.body.username)
+    const email =
+      req.body.email === undefined ? current.email : String(req.body.email)
+    const password =
+      req.body.password === undefined || req.body.password === ''
+        ? undefined
+        : String(req.body.password)
+
+    const u = username.trim()
+    const e = email.trim().toLowerCase()
+    if (u.length < 3) {
+      throw new AppError('El usuario debe tener al menos 3 caracteres')
+    }
+    if (!e.includes('@') || e.length < 5) throw new AppError('Correo inválido')
+    if (password !== undefined && password.length < 6) {
+      throw new AppError('La contraseña debe tener al menos 6 caracteres')
+    }
+
+    const [existingUser] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM users WHERE username = ? AND id <> ? LIMIT 1',
+      [u, current.id],
+    )
+    if (existingUser.length > 0) {
+      throw new AppError('Ese nombre de usuario ya existe')
+    }
+
+    const [existingEmail] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM users WHERE email = ? AND id <> ? LIMIT 1',
+      [e, current.id],
+    )
+    if (existingEmail.length > 0) {
+      throw new AppError('Ese correo ya está registrado')
+    }
+
+    if (password) {
+      const passwordHash = await bcrypt.hash(password, 10)
+      await pool.query(
+        `UPDATE users SET username = ?, email = ?, password_hash = ? WHERE id = ?`,
+        [u, e, passwordHash, current.id],
+      )
+    } else {
+      await pool.query(`UPDATE users SET username = ?, email = ? WHERE id = ?`, [
+        u,
+        e,
+        current.id,
+      ])
+    }
+
+    const user: PublicUser = {
+      id: current.id,
+      username: u,
+      email: e,
+      role: current.role,
+    }
+    res.json(user)
   }),
 )
 

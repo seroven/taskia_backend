@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { pool } from '../db/pool.js'
-import { requireAuth } from '../middleware/auth.js'
+import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
 import {
   AppError,
@@ -18,7 +18,7 @@ const TASK_SELECT = `
     t.id, t.user_id, t.course_id, c.name AS course_name,
     t.difficulty_id, d.code AS difficulty_code, d.name AS difficulty_name,
     t.title, t.description, t.task_kind, t.status, t.board_order,
-    t.study_passed, t.uses_board, t.due_date, t.created_at, t.updated_at
+    t.study_passed, t.uses_board, t.study_mode_chosen, t.due_date, t.created_at, t.updated_at
   FROM tasks t
   INNER JOIN courses c ON c.id = t.course_id
   INNER JOIN difficulties d ON d.id = t.difficulty_id
@@ -40,6 +40,7 @@ function mapTask(r: RowDataPacket) {
     board_order: Number(r.board_order),
     study_passed: Boolean(r.study_passed),
     uses_board: Number(r.uses_board) !== 0,
+    study_mode_chosen: Number(r.study_mode_chosen) !== 0,
     due_date: formatMysqlDate(r.due_date as Date | string),
     created_at: formatMysqlDateTime(r.created_at as Date) ?? '',
     updated_at: formatMysqlDateTime(r.updated_at as Date) ?? '',
@@ -84,17 +85,22 @@ function ensureCanMarkDone(
 ) {
   if (nextStatus !== 'done') return
   if (currentStatus === 'done') return
-  if (difficultyCode === 'high' && !studyPassed) {
+  if (studyPassed) return
+  if (difficultyCode === 'high' || currentStatus === 'studying') {
     throw new AppError(
-      'Esta tarea es de dificultad Alta. Primero estudiala con el tutor hasta que diga que estás listo.',
+      difficultyCode === 'high'
+        ? 'Esta tarea es de dificultad Alta. Primero estudiala con el tutor hasta que diga que estás listo.'
+        : 'Primero estudia con el tutor hasta que diga que estás listo para Terminado.',
     )
   }
 }
 
-async function ensureCourse(courseId: number) {
+async function ensureCourse(courseId: number, userId: number, mustBeActive = true) {
   const [rows] = await pool.query<RowDataPacket[]>(
-    'SELECT id FROM courses WHERE id = ? AND is_active = 1 LIMIT 1',
-    [courseId],
+    mustBeActive
+      ? 'SELECT id FROM courses WHERE id = ? AND user_id = ? AND is_active = 1 LIMIT 1'
+      : 'SELECT id FROM courses WHERE id = ? AND user_id = ? LIMIT 1',
+    [courseId, userId],
   )
   if (!rows[0]) throw new AppError('Curso no válido')
 }
@@ -108,6 +114,7 @@ async function ensureDifficulty(difficultyId: number) {
 }
 
 router.use(requireAuth)
+router.use(requireStudent)
 
 router.get(
   '/',
@@ -168,9 +175,9 @@ router.post(
     const courseId = Number(req.body.course_id)
     const difficultyId = Number(req.body.difficulty_id)
     const usesBoard =
-      req.body.uses_board === undefined ? true : Boolean(req.body.uses_board)
+      req.body.uses_board === undefined ? false : Boolean(req.body.uses_board)
 
-    await ensureCourse(courseId)
+    await ensureCourse(courseId, userId)
     await ensureDifficulty(difficultyId)
 
     const [maxRows] = await pool.query<RowDataPacket[]>(
@@ -223,7 +230,7 @@ router.patch(
         ? undefined
         : Boolean(req.body.uses_board)
 
-    await ensureCourse(courseId)
+    await ensureCourse(courseId, userId, false)
     await ensureDifficulty(difficultyId)
 
     const current = await fetchTask(taskId, userId)
@@ -249,10 +256,15 @@ router.patch(
     }
 
     const nextUsesBoard = usesBoard === undefined ? current.uses_board : usesBoard
+    const nextModeChosen =
+      req.body.study_mode_chosen === undefined
+        ? current.study_mode_chosen
+        : Boolean(req.body.study_mode_chosen)
 
     const [result] = await pool.query<ResultSetHeader>(
       `UPDATE tasks SET title = ?, description = ?, course_id = ?, difficulty_id = ?,
-        task_kind = ?, due_date = ?, status = ?, board_order = ?, uses_board = ?
+        task_kind = ?, due_date = ?, status = ?, board_order = ?, uses_board = ?,
+        study_mode_chosen = ?
        WHERE id = ? AND user_id = ?`,
       [
         title,
@@ -264,6 +276,7 @@ router.patch(
         status,
         boardOrder,
         nextUsesBoard ? 1 : 0,
+        nextModeChosen ? 1 : 0,
         taskId,
         userId,
       ],
