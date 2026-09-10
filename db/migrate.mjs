@@ -5,7 +5,7 @@
  *   npm run db:migrate   → aplica migraciones pendientes en db/migrations/
  *
  * Env: usa MYSQL_* del --env-file del script npm (.env.development por defecto).
- * Override: TASKIA_ENV=qa|production o --env=qa
+ * Override: TASKIA_ENV=qa|pd|production o --env=pd
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -20,14 +20,13 @@ const args = process.argv.slice(2)
 const setupOnly = args.includes('--setup')
 const envArg = args.find((a) => a.startsWith('--env='))?.slice('--env='.length)
 const envName = envArg || process.env.TASKIA_ENV || 'development'
-const envFile =
-  envName === 'development'
-    ? '.env.development'
-    : envName === 'qa'
-      ? '.env.qa'
-      : envName === 'production'
-        ? '.env.production'
-        : `.env.${envName}`
+const envFiles = {
+  development: '.env.development',
+  qa: '.env.qa',
+  pd: '.env.pd',
+  production: '.env.production',
+}
+const envFile = envFiles[envName] ?? `.env.${envName}`
 
 const envPath = path.join(root, envFile)
 if (fs.existsSync(envPath)) {

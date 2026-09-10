@@ -5,19 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch --env-file=.env.development src/index.ts",
+    "dev:pd": "tsx watch --env-file=.env.pd src/index.ts",
     "build": "tsc",
+    "build:qa": "tsc",
+    "build:pd": "tsc",
     "start": "node dist/index.js",
     "start:dev": "tsx --env-file=.env.development src/index.ts",
     "start:qa": "tsx --env-file=.env.qa src/index.ts",
-    "start:pd": "tsx --env-file=.env.production src/index.ts",
-    "build:qa": "tsc",
-    "build:pd": "tsc",
+    "start:pd": "node --env-file=.env.pd dist/index.js",
     "db:setup": "node --env-file=.env.development db/migrate.mjs --setup",
     "db:migrate": "node --env-file=.env.development db/migrate.mjs",
     "db:setup:qa": "node --env-file=.env.qa db/migrate.mjs --setup",
     "db:migrate:qa": "node --env-file=.env.qa db/migrate.mjs",
-    "db:setup:pd": "node --env-file=.env.production db/migrate.mjs --setup",
-    "db:migrate:pd": "node --env-file=.env.production db/migrate.mjs"
+    "db:setup:pd": "node --env-file=.env.pd db/migrate.mjs --setup",
+    "db:migrate:pd": "node --env-file=.env.pd db/migrate.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
