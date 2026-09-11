@@ -646,27 +646,59 @@ router.get(
       child: number
       prompt: number
       output: number
+      tutorPrompt: number
+      tutorOutput: number
+      challengesPrompt: number
+      challengesOutput: number
+      voicePrompt: number
+      voiceOutput: number
     }
+    const emptyUse = (): UserUse => ({
+      tutor: 0,
+      challenges: 0,
+      created: 0,
+      voice: 0,
+      child: 0,
+      prompt: 0,
+      output: 0,
+      tutorPrompt: 0,
+      tutorOutput: 0,
+      challengesPrompt: 0,
+      challengesOutput: 0,
+      voicePrompt: 0,
+      voiceOutput: 0,
+    })
     const userUse = new Map<number, UserUse>()
     const bumpUser = (id: number, patch: Partial<UserUse>) => {
-      const cur = userUse.get(id) ?? {
-        tutor: 0,
-        challenges: 0,
-        created: 0,
-        voice: 0,
-        child: 0,
-        prompt: 0,
-        output: 0,
-      }
-      userUse.set(id, {
+      const cur = userUse.get(id) ?? emptyUse()
+      const prompt = patch.prompt ?? 0
+      const output = patch.output ?? 0
+      const next: UserUse = {
         tutor: cur.tutor + (patch.tutor ?? 0),
         challenges: cur.challenges + (patch.challenges ?? 0),
         created: cur.created + (patch.created ?? 0),
         voice: cur.voice + (patch.voice ?? 0),
         child: cur.child + (patch.child ?? 0),
-        prompt: cur.prompt + (patch.prompt ?? 0),
-        output: cur.output + (patch.output ?? 0),
-      })
+        prompt: cur.prompt + prompt,
+        output: cur.output + output,
+        tutorPrompt: cur.tutorPrompt,
+        tutorOutput: cur.tutorOutput,
+        challengesPrompt: cur.challengesPrompt,
+        challengesOutput: cur.challengesOutput,
+        voicePrompt: cur.voicePrompt,
+        voiceOutput: cur.voiceOutput,
+      }
+      if ((patch.tutor ?? 0) > 0) {
+        next.tutorPrompt += prompt
+        next.tutorOutput += output
+      } else if ((patch.challenges ?? 0) > 0) {
+        next.challengesPrompt += prompt
+        next.challengesOutput += output
+      } else if ((patch.voice ?? 0) > 0) {
+        next.voicePrompt += prompt
+        next.voiceOutput += output
+      }
+      userUse.set(id, next)
     }
 
     const measured = realUsageRows.length > 0
@@ -722,11 +754,6 @@ router.get(
       }
     }
 
-    const kindCalls = {
-      tutor: 0,
-      challenges: 0,
-      voice: 0,
-    }
     const hasTranscribeLog = realUsageRows.some(
       (row) => String(row.kind ?? '') === 'transcribe',
     )
@@ -743,20 +770,14 @@ router.get(
         if (kind === 'transcribe') {
           addNum(voiceByDay, day, count)
           bumpUser(id, { voice: count, prompt, output })
-          kindCalls.voice += count
         } else if (kind === 'challenge_generate' || kind === 'challenge_grade') {
           addNum(challengeByDay, day, count)
           bumpUser(id, { challenges: count, prompt, output })
-          kindCalls.challenges += count
         } else {
           addNum(tutorByDay, day, count)
           bumpUser(id, { tutor: count, prompt, output })
-          kindCalls.tutor += count
         }
       }
-    } else {
-      kindCalls.tutor = [...tutorByDay.values()].reduce((a, b) => a + b, 0)
-      kindCalls.challenges = [...challengeByDay.values()].reduce((a, b) => a + b, 0)
     }
 
     if (!hasTranscribeLog) {
@@ -777,10 +798,6 @@ router.get(
       bumpUser(Number(row.user_id), { created: Number(row.c ?? 0) })
     }
 
-    if (kindCalls.voice === 0) {
-      kindCalls.voice = [...voiceByDay.values()].reduce((a, b) => a + b, 0)
-    }
-
     const names = new Map(
       roster.map((r) => [Number(r.id), r.username as string]),
     )
@@ -796,6 +813,9 @@ router.get(
         calls: row.tutor + row.challenges + row.voice,
         tokens: row.prompt + row.output,
         estimated_usd: usdFromTokens(row.prompt, row.output),
+        usd_tutor: usdFromTokens(row.tutorPrompt, row.tutorOutput),
+        usd_challenges: usdFromTokens(row.challengesPrompt, row.challengesOutput),
+        usd_voice: usdFromTokens(row.voicePrompt, row.voiceOutput),
       }))
       .filter(
         (row) =>
@@ -833,11 +853,50 @@ router.get(
       totals: usageTotals,
       days: usageDays,
       by_student: usageByStudent,
-      by_kind: [
-        { kind: 'tutor', label: 'Tutor', calls: kindCalls.tutor },
-        { kind: 'challenges', label: 'Desafíos', calls: kindCalls.challenges },
-        { kind: 'voice', label: 'Transcripciones', calls: kindCalls.voice },
-      ],
+      by_kind: (() => {
+        const totals = {
+          tutor: { calls: 0, prompt: 0, output: 0 },
+          challenges: { calls: 0, prompt: 0, output: 0 },
+          voice: { calls: 0, prompt: 0, output: 0 },
+        }
+        for (const row of userUse.values()) {
+          totals.tutor.calls += row.tutor
+          totals.tutor.prompt += row.tutorPrompt
+          totals.tutor.output += row.tutorOutput
+          totals.challenges.calls += row.challenges
+          totals.challenges.prompt += row.challengesPrompt
+          totals.challenges.output += row.challengesOutput
+          totals.voice.calls += row.voice
+          totals.voice.prompt += row.voicePrompt
+          totals.voice.output += row.voiceOutput
+        }
+        return [
+          {
+            kind: 'tutor',
+            label: 'Mensajes',
+            calls: totals.tutor.calls,
+            tokens: totals.tutor.prompt + totals.tutor.output,
+            estimated_usd: usdFromTokens(totals.tutor.prompt, totals.tutor.output),
+          },
+          {
+            kind: 'challenges',
+            label: 'Desafíos',
+            calls: totals.challenges.calls,
+            tokens: totals.challenges.prompt + totals.challenges.output,
+            estimated_usd: usdFromTokens(
+              totals.challenges.prompt,
+              totals.challenges.output,
+            ),
+          },
+          {
+            kind: 'voice',
+            label: 'Transcripciones',
+            calls: totals.voice.calls,
+            tokens: totals.voice.prompt + totals.voice.output,
+            estimated_usd: usdFromTokens(totals.voice.prompt, totals.voice.output),
+          },
+        ]
+      })(),
     }
 
     res.json({

@@ -19,18 +19,28 @@ const router = Router()
 const MAX_CONTEXT = 400
 const MAX_MEMORY = 600
 const MAX_SPEAK = 450
-const MAX_BOARD = 500
+const MAX_BOARD = 1600
 const MAX_LAST_TUTOR = 320
 
 function emptyBoard() {
   return {
-    type: 'excalidraw',
-    version: 2,
-    source: 'taskia',
-    elements: [],
-    appState: { viewBackgroundColor: '#ffffff' },
-    files: {},
+    type: 'taskia-grid',
+    version: 1,
+    source: 'taskia-grid',
+    cols: 160,
+    rows: 100,
+    items: [],
   }
+}
+
+function coerceBoard(raw: unknown) {
+  if (raw && typeof raw === 'object') {
+    const rec = raw as { type?: string; source?: string; items?: unknown }
+    if (rec.type === 'taskia-grid' || rec.source === 'taskia-grid') {
+      return raw
+    }
+  }
+  return emptyBoard()
 }
 
 function canOpenStudy(task: { status: string; difficulty_code: string }) {
@@ -41,15 +51,29 @@ function canOpenStudy(task: { status: string; difficulty_code: string }) {
 }
 
 /** Instrucciones de pizarra (mismo contrato que taskia_desktop/src-tauri/src/study.rs). */
-const DRAW_OPS_PROMPT = `Pizarra de salida: allow_ai_draw=true. Si el niño pide ejercicio nuevo, practica, o conviene visualizar:
-1) Empieza con {"op":"clear_board"} (la app borra toda la pizarra y centra tu dibujo grande).
-2) Dibuja con 3–8 ops. Preferí stamps con scale≈2; luego shape/text con labels.
-3) No dejes números/figuras solo en speak_to_child: deben ir en draw_ops.
-4) Coordenadas relativas libres (la app re-centra). Labels claros (base, altura, lados).
-Stamps: right_triangle, circle, square, number_line, arrow.
-Shapes: rectangle|ellipse|triangle|line|arrow|text (x,y,w,h,label?,color?).
-Ejemplo (triángulo base 8 altura 4):
-[{"op":"clear_board"},{"op":"stamp","id":"right_triangle","x":0,"y":0,"scale":2},{"op":"shape","type":"text","x":110,"y":175,"label":"8"},{"op":"shape","type":"text","x":-30,"y":70,"label":"4"}]
+const DRAW_OPS_PROMPT = `Pizarra de salida: allow_ai_draw=true. Grilla 160×100. Origen arriba-izquierda. SOLO enteros de celda. NUNCA píxeles.
+El sistema pinta en violeta (ignorá color). Empieza con {"op":"clear_board"}.
+
+COORDENADAS (exactitud):
+- Dibujá SOLO en el marco central: col 56–104, fila 36–64. No uses el origen (0,0).
+- 1 celda = 1 unidad. Si una etiqueta de medida es N, ESE lado/base/altura/radio debe medir N celdas (w, h o |endCol-col|+1).
+- Las etiquetas van en la celda contigua al lado que describen (no adentro de la figura, no sueltas lejos).
+- Preferí shape con w/h o line con endCol/endRow. Si usás stamp, pasá w y h (no te fíes solo de scale).
+- El sistema puede CENTRAR el grupo; las DISTANCIAS entre tus ops no se estiran: tienen que nacer ya correctas.
+
+CÓMO DIBUJAR:
+A) Geometría: figura real (stamp/shape). PROHIBIDO ASCII. Medidas = texto h=1.
+B) Ecuación/secuencia/cálculo: SOLO texto. Sin recuadros de adorno.
+C) NUNCA enmarques el problema.
+
+Stamps: right_triangle, circle, square, arrow.
+Shapes: rectangle|ellipse|triangle|line|arrow|text.
+Línea/flecha: de (col,row) a (endCol,endRow).
+Texto: h=1, w = caracteres.
+
+Ejemplo texto: [{"op":"clear_board"},{"op":"shape","type":"text","col":64,"row":48,"w":11,"h":1,"label":"x + 5 = 12"}]
+Ejemplo figura+medidas: [{"op":"clear_board"},{"op":"shape","type":"rectangle","col":70,"row":42,"w":8,"h":5},{"op":"shape","type":"text","col":73,"row":48,"w":1,"h":1,"label":"8"},{"op":"shape","type":"text","col":68,"row":44,"w":1,"h":1,"label":"5"}]
+Ejemplo segmento: [{"op":"clear_board"},{"op":"shape","type":"line","col":64,"row":50,"endCol":75,"endRow":50},{"op":"shape","type":"text","col":69,"row":51,"w":2,"h":1,"label":"12"}]
 `
 
 function tutorSystemPrompt(allowAiDraw: boolean) {
@@ -149,7 +173,7 @@ async function loadBoard(taskId: number) {
   )
   if (rows[0]?.board_json) {
     try {
-      return JSON.parse(rows[0].board_json as string)
+      return coerceBoard(JSON.parse(rows[0].board_json as string))
     } catch {
       /* fallthrough */
     }
@@ -353,9 +377,6 @@ router.post(
     const boardDescription = task.uses_board
       ? ((req.body.board_description ?? req.body.boardDescription) as string | null)
       : null
-    const boardImageBase64 = task.uses_board
-      ? ((req.body.board_image_base64 ?? req.body.boardImageBase64) as string | null)
-      : null
     const fromVoice = Boolean(req.body.from_voice ?? req.body.fromVoice)
 
     const context = await loadContext(taskId)
@@ -419,7 +440,6 @@ router.post(
     const raw = await callGemini({
       system: tutorSystemPrompt(allowAiDraw),
       user: JSON.stringify(payload),
-      boardImageBase64: boardHas ? boardImageBase64 : null,
       usage: { userId, kind: 'task_tutor' },
     })
 

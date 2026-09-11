@@ -23,7 +23,7 @@ El producto es una app de estudio para **alumnos** (`role: user`) con un **adult
 - Materias por alumno (crear, renombrar, archivar, importar de otro alumno).
 - Ficha: overview, tareas, sesiones de estudio, árbol de mundos y detalle de un desafío.
 
-Gemini vive en `src/services/gemini.ts` (tutor, transcripciones, generación y corrección de desafíos). El uso se registra en `llm_usage`. La pizarra Excalidraw se renderiza en el front; aquí solo se guarda la escena y, si aplica, operaciones de dibujo (`draw_ops`).
+Gemini vive en `src/services/gemini.ts` (tutor, transcripciones, generación y corrección de desafíos). El uso se registra en `llm_usage`. La pizarra cuadriculada se renderiza en el front; aquí se guarda la escena JSON y, si aplica, operaciones de dibujo (`draw_ops`).
 
 ## Cómo correrlo
 

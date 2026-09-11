@@ -29,13 +29,21 @@ const MISSION_SELECT = `
 
 function emptyBoard() {
   return {
-    type: 'excalidraw',
-    version: 2,
-    source: 'taskia',
-    elements: [],
-    appState: { viewBackgroundColor: '#ffffff' },
-    files: {},
+    type: 'taskia-grid',
+    version: 1,
+    source: 'taskia-grid',
+    cols: 160,
+    rows: 100,
+    items: [],
   }
+}
+
+function coerceBoard(raw: unknown) {
+  if (raw && typeof raw === 'object') {
+    const rec = raw as { type?: string; source?: string }
+    if (rec.type === 'taskia-grid' || rec.source === 'taskia-grid') return raw
+  }
+  return emptyBoard()
 }
 
 function mapWorld(r: RowDataPacket) {
@@ -230,7 +238,7 @@ async function loadMissionBoard(missionId: number) {
   )
   if (rows[0]?.board_json) {
     try {
-      return JSON.parse(rows[0].board_json as string)
+      return coerceBoard(JSON.parse(rows[0].board_json as string))
     } catch {
       /* fall through */
     }
@@ -273,37 +281,37 @@ async function insertMissionMessage(
   }
 }
 
-const MISSION_DRAW_OPS_PROMPT = `Pizarra de salida: allow_ai_draw=true. Si el niño pide ejercicio nuevo, practica, o conviene visualizar:
-1) Empieza con {"op":"clear_board"} (la app borra toda la pizarra y centra tu dibujo grande).
-2) Dibuja con 3–8 ops. Preferí stamps con scale≈2; luego shape/text con labels.
-3) No dejes números/figuras solo en speak_to_child: deben ir en draw_ops.
-4) Coordenadas relativas libres (la app re-centra). Labels claros (base, altura, lados).
-Stamps: right_triangle, circle, square, number_line, arrow.
-Shapes: rectangle|ellipse|triangle|line|arrow|text (x,y,w,h,label?,color?).
-Ejemplo (triángulo base 8 altura 4):
-[{"op":"clear_board"},{"op":"stamp","id":"right_triangle","x":0,"y":0,"scale":2},{"op":"shape","type":"text","x":110,"y":175,"label":"8"},{"op":"shape","type":"text","x":-30,"y":70,"label":"4"}]
+const MISSION_DRAW_OPS_PROMPT = `Pizarra: grilla 160×100. Enteros. NUNCA píxeles. Violeta reservado. Empieza con {"op":"clear_board"}.
+COORDENADAS: dibujá en col 56–104, fila 36–64. 1 celda = 1 unidad: si la etiqueta es N, ese lado/radio mide N celdas. Labels pegados al lado que describen. Preferí w/h o endCol/endRow; stamp también con w,h.
+Geometría: figura real. Cálculo: solo texto, sin marco.
+Stamps: right_triangle, circle, square, arrow. Shapes: rectangle|ellipse|triangle|line|arrow|text.
+Ejemplo: [{"op":"clear_board"},{"op":"shape","type":"rectangle","col":70,"row":42,"w":8,"h":5},{"op":"shape","type":"text","col":73,"row":48,"w":1,"h":1,"label":"8"}]
 `
 
 const CHALLENGE_BOARD_DRAW_OPS = `Pizarra del ENUNCIADO (SOLO si kind=board_prompt y requires_board=true):
+- Grilla 160×100. Dibujá en col 56–104, fila 36–64. 1 celda = 1 unidad (si la medida es N, ese lado mide N celdas).
 - Esto NO es un tutor: no converses, no des pistas, no dibujes la solución.
 - "prompt" = instrucción breve (qué hay que hacer).
 - "draw_ops" = lo que el niño DEBE VER para resolver. Tiene que coincidir con el tema del prompt.
 - Si la pregunta NO usa pizarra (requires_board=false): draw_ops SIEMPRE []. No dibujes nada.
 
 Cómo elegir las ops (regla dura):
-1) Ecuación, cálculo, despejar, completar un número: SOLO texto grande con la expresión EXACTA.
+1) Ecuación, cálculo, despejar, completar un número: SOLO texto con la expresión EXACTA.
    PROHIBIDO square, rectangle, circle, triangle, stamps.
-   Ejemplo: prompt "Resuelve la ecuación"
-   [{"op":"clear_board"},{"op":"shape","type":"text","x":0,"y":0,"label":"x + 5 = 12"}]
-2) Geometría (área, perímetro, figura): usa el stamp/shape de ESA figura + labels de las medidas.
-   Un square SOLO si el problema es un cuadrado. Un triángulo SOLO si es un triángulo.
-3) Recta numérica: stamp number_line + marcas/texto.
+   Texto: h=1, un carácter por celda, w = largo (espacios cuentan).
+   Ejemplo: [{"op":"clear_board"},{"op":"shape","type":"text","col":64,"row":48,"w":11,"h":1,"label":"x + 5 = 12"}]
+2) Geometría (área, perímetro, figura, ángulo): OBLIGATORIO dibujar ESA figura con stamp/shape. PROHIBIDO simularla con texto/ASCII.
+   Un square SOLO si el problema es un cuadrado. Un triángulo SOLO si es un triángulo. Círculo=circle/ellipse. Segmento=line.
+   Labels de medidas: texto h=1 al lado de la figura.
+3) Recta numérica: shape line horizontal + texto de las marcas (un carácter por celda).
 4) Frase o dato: texto del dato, sin recuadro.
 
 NUNCA enmarques el problema con un rectángulo o cuadrado “de adorno”.
 NUNCA dejes draw_ops vacío si requires_board=true. Empieza con {"op":"clear_board"}.
-Stamps permitidos: right_triangle, circle, square, number_line, arrow.
-Shapes: rectangle|ellipse|triangle|line|arrow|text (x,y,w,h,label?,color?).
+Stamps permitidos: right_triangle, circle, square, arrow.
+Shapes: rectangle|ellipse|triangle|line|arrow|text (col,row,w,h,label?,color?).
+Línea/flecha: de (col,row) a (endCol,endRow).
+El sistema pinta el enunciado en violeta reservado (no uses color de la paleta del niño).
 `
 
 function drawableOps(raw: unknown): unknown[] {
@@ -388,7 +396,7 @@ function fallbackDrawOpsForPrompt(prompt: string): unknown[] {
   const label = truncateChars(prompt.trim() || 'Resuelve en la pizarra', 80)
   return [
     { op: 'clear_board' },
-    { op: 'shape', type: 'text', x: 0, y: 0, label },
+    { op: 'shape', type: 'text', col: 6, row: 8, w: 20, h: 2, label },
   ]
 }
 
@@ -405,27 +413,34 @@ function describeBoardJson(raw: unknown): string {
     }
   }
   if (!value || typeof value !== 'object') return ''
-  const rec = value as { elements?: unknown }
+  const rec = value as {
+    type?: string
+    source?: string
+    cols?: number
+    rows?: number
+    items?: unknown
+    elements?: unknown
+  }
+  const items = Array.isArray(rec.items) ? rec.items : []
+  if (rec.type === 'taskia-grid' || rec.source === 'taskia-grid' || items.length > 0) {
+    const cols = Number(rec.cols ?? 160)
+    const rows = Number(rec.rows ?? 100)
+    const header = `Grilla ${cols}x${rows} (col 0–${cols - 1}, fila 0–${rows - 1}). Origen arriba-izquierda.`
+    const rowsOut = items.slice(0, 40).map((el) => {
+      if (!el || typeof el !== 'object') return ''
+      const item = el as Record<string, unknown>
+      const who = item.layer === 'ai' ? 'AI' : 'Alumno'
+      const kind = String(item.stamp ?? item.kind ?? 'forma')
+      const text = typeof item.text === 'string' && item.text.trim() ? ` "${item.text.trim()}"` : ''
+      return `${who}: ${kind}${text} en (${Number(item.col ?? 0)},${Number(item.row ?? 0)}) ${Number(item.w ?? 1)}x${Number(item.h ?? 1)}`
+    })
+    if (items.length === 0) return `${header}\nLa pizarra está vacía.`
+    const extra = items.length > 40 ? `\n…y ${items.length - 40} formas más.` : ''
+    return `${header}\n${rowsOut.filter(Boolean).join('\n')}${extra}`
+  }
   const elements = Array.isArray(rec.elements) ? rec.elements : []
-  const alive = elements.filter((el) => {
-    if (!el || typeof el !== 'object') return false
-    return !(el as { isDeleted?: boolean }).isDeleted
-  }) as Array<Record<string, unknown>>
-  if (alive.length === 0) return 'La pizarra está vacía.'
-  const lines = alive.slice(0, 40).map((el, index) => {
-    const type = String(el.type ?? 'forma')
-    const text = typeof el.text === 'string' ? el.text.trim() : ''
-    const layer =
-      el.customData && typeof el.customData === 'object'
-        ? String((el.customData as { layer?: string }).layer ?? '')
-        : ''
-    const who = layer === 'ai' ? 'enunciado' : 'alumno'
-    if (type === 'text' && text) return `${index + 1}. [${who}] texto "${text}"`
-    if (text) return `${index + 1}. [${who}] ${type} "${text}"`
-    return `${index + 1}. [${who}] ${type}`
-  })
-  const extra = alive.length > 40 ? `\n…y ${alive.length - 40} elementos más.` : ''
-  return `La pizarra tiene ${alive.length} elemento(s):\n${lines.join('\n')}${extra}`
+  if (elements.length === 0) return 'La pizarra está vacía.'
+  return `La pizarra tiene ${elements.length} elemento(s) en un formato viejo.`
 }
 
 async function ensureChallengeBoardDrawOps(
@@ -1370,9 +1385,6 @@ router.post(
     const raw = await callGemini({
       system: missionTutorPrompt(allowAiDraw),
       user: payload,
-      boardImageBase64: boardHas
-        ? (req.body.board_image_base64 as string | null | undefined) ?? null
-        : null,
       usage: { userId, kind: 'mission_tutor' },
     })
 
