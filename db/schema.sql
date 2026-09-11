@@ -228,6 +228,7 @@ CREATE TABLE IF NOT EXISTS study_mission_sessions (
   tutor_phase ENUM('understanding', 'practicing', 'reviewing') NOT NULL DEFAULT 'understanding',
   topic_summary TEXT NOT NULL,
   context_summary TEXT NOT NULL,
+  notebook_context TEXT NOT NULL,
   hints_level INT NOT NULL DEFAULT 0,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (mission_id),

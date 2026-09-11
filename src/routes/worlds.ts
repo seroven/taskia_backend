@@ -17,6 +17,8 @@ import {
 
 const router = Router()
 
+const MAX_NOTEBOOK = 8000
+
 const MISSION_SELECT = `
   SELECT m.id, m.world_id, m.course_id, c.name AS course_name,
          m.title, m.description, m.status, m.uses_board,
@@ -153,8 +155,8 @@ async function listMissions(worldId: number, courseId: number, userId: number) {
 async function ensureMissionSession(missionId: number) {
   await pool.query(
     `INSERT INTO study_mission_sessions
-       (mission_id, tutor_phase, topic_summary, context_summary, hints_level)
-     VALUES (?, 'understanding', '', '', 0)
+       (mission_id, tutor_phase, topic_summary, context_summary, notebook_context, hints_level)
+     VALUES (?, 'understanding', '', '', '', 0)
      ON DUPLICATE KEY UPDATE mission_id = mission_id`,
     [missionId],
   )
@@ -163,7 +165,7 @@ async function ensureMissionSession(missionId: number) {
 async function loadMissionContext(missionId: number) {
   await ensureMissionSession(missionId)
   const [sessionRows] = await pool.query<RowDataPacket[]>(
-    `SELECT tutor_phase, topic_summary, context_summary, hints_level, updated_at
+    `SELECT tutor_phase, topic_summary, context_summary, notebook_context, hints_level, updated_at
      FROM study_mission_sessions WHERE mission_id = ? LIMIT 1`,
     [missionId],
   )
@@ -180,6 +182,7 @@ async function loadMissionContext(missionId: number) {
     tutor_phase: session.tutor_phase as string,
     topic_summary: session.topic_summary as string,
     context_summary: session.context_summary as string,
+    notebook_context: String(session.notebook_context ?? ''),
     hints_level: Number(session.hints_level),
     messages: msgRows.map((m) => ({
       role: m.role as string,
@@ -187,6 +190,27 @@ async function loadMissionContext(missionId: number) {
       created_at: formatMysqlDateTime(m.created_at as Date | string) ?? '',
     })),
   }
+}
+
+async function ensureNotebookContext(
+  missionId: number,
+  usesBoard: boolean,
+  context: {
+    notebook_context: string
+    messages: Array<{ role: string; content: string }>
+  },
+) {
+  if (usesBoard) return
+  if (context.notebook_context.trim()) return
+  const firstUser = context.messages.find((m) => m.role === 'user')
+  if (!firstUser?.content.trim()) return
+  context.notebook_context = firstUser.content
+  await pool.query(
+    `UPDATE study_mission_sessions
+     SET notebook_context = ?
+     WHERE mission_id = ? AND (notebook_context IS NULL OR notebook_context = '')`,
+    [firstUser.content, missionId],
+  )
 }
 
 async function saveMissionBoardDb(missionId: number, board: unknown) {
@@ -479,7 +503,7 @@ Incluye exactamente un objeto por cada problema recibido.`,
 function missionTutorPrompt(allowAiDraw: boolean): string {
   let p = `Tutor amable para niño ~10 años. Español latinoamericano, claro y breve.
 Enseñas un TEMA completo (misión), no una tarea escolar suelta. Guía con preguntas/pistas; no des la solución completa.
-Recibes context_summary, last_tutor_message. Conserva coherencia con el ejercicio/ejemplo abierto.
+Recibes context_summary (resumen corto de ESTA charla) y last_tutor_message. Conserva coherencia con el ejercicio/ejemplo abierto.
 Pizarra de entrada: si board_has_drawing=false, ignora lo que haya dibujado el niño.
 Responde SOLO JSON (sin markdown):
 {"phase":"understanding|practicing|reviewing","speak_to_child":"...","ask_questions":[],"topic_summary":"...","context_summary":"...","draw_ops":[],"hints_level":0,"study_eval":{"passed":false,"evidence":""}}
@@ -496,7 +520,9 @@ Si message_source=voice: el niño habló (audio transcrito). Usa ese relato para
 `
   if (!allowAiDraw) {
     p += `draw_ops siempre []. No dibujes en la pizarra. Todo el recorrido (básico + observación) ocurre en el chat.
-En context_summary lleva SIEMPRE "Errores: N" (N = veces que el niño se equivocó). Si se equivoca, la siguiente pregunta refuerza ese punto débil. Pregunta TODO lo posible del tema (hechos, causas, detalles, ejemplos).
+Recibes notebook_context: relato FIJO del cuaderno. NUNCA lo reescribas ni lo copies a context_summary. Es LA fuente del tema.
+PROHIBIDO preguntar, afirmar o evaluar hechos, nombres, fechas o detalles que NO estén en notebook_context, el título o la descripción. Si notebook_context está vacío, pide con cariño que te cuente lo de su tema; no inventes contenido.
+En context_summary lleva SIEMPRE "Errores: N" (N = veces que el niño se equivocó). Si se equivoca, la siguiente pregunta refuerza ese punto débil. Pregunta TODO lo posible de notebook_context (hechos, causas, detalles, ejemplos).
 Dominio (study_eval.passed=true) SOLO si TODOS se cumplen. Si falta uno → passed=false:
 1) phase=reviewing (nunca en understanding ni practicing)
 2) Piso de mensajes del niño: user_turns ≥ 10 + Errores. Si user_turns < 10+N → passed=false SIEMPRE. Cada error sube el piso.
@@ -589,7 +615,7 @@ async function missionsForChallenge(
 
 async function loadMissionStudyMaterial(missionId: number) {
   const [sessionRows] = await pool.query<RowDataPacket[]>(
-    `SELECT topic_summary, context_summary
+    `SELECT topic_summary, context_summary, notebook_context
      FROM study_mission_sessions WHERE mission_id = ? LIMIT 1`,
     [missionId],
   )
@@ -607,6 +633,8 @@ async function loadMissionStudyMaterial(missionId: number) {
     .filter(Boolean)
     .map((c) => truncateChars(c, 900))
 
+  const notebook = String(sessionRows[0]?.notebook_context ?? '').trim()
+
   return {
     topic_summary: truncateChars(
       String(sessionRows[0]?.topic_summary ?? ''),
@@ -617,7 +645,10 @@ async function loadMissionStudyMaterial(missionId: number) {
       500,
     ),
     user_explanations: userExplanations,
-    studied_text: truncateChars(userExplanations.join('\n---\n'), 3500),
+    studied_text: truncateChars(
+      notebook || userExplanations.join('\n---\n'),
+      MAX_NOTEBOOK,
+    ),
   }
 }
 
@@ -734,7 +765,7 @@ NO enseñes y NO converses: solo enunciados evaluables. Responde SOLO un JSON ar
 
 REGLA DE CONTENIDO (la más importante):
 - Pregunta SOLO sobre hechos, nombres, fechas, ideas o ejemplos que aparezcan en studied_text, topic_summary, context_summary o description de la misión.
-- studied_text = lo que el niño contó o escribió sobre el tema en el estudio. Es la fuente principal.
+- studied_text = el relato del cuaderno (lo que el niño contó al empezar el tema). Es la fuente principal.
 - PROHIBIDO usar conocimiento general del tema si no está en esas fuentes (aunque el título diga "Independencia del Perú" u otro tema amplio).
 - Si studied_text está vacío o es muy corto, limita las preguntas a lo poco que sí esté en description/topic_summary/context_summary. No inventes batallas, fechas o personajes extras.
 - Las opciones incorrectas de multiple_choice pueden ser plausibles, pero la respuesta correcta DEBE basarse en el material estudiado.
@@ -1196,14 +1227,15 @@ router.get(
     }
 
     const context = await loadMissionContext(missionId)
+    await ensureNotebookContext(missionId, mission.uses_board, context)
     const board = mission.uses_board
       ? await loadMissionBoard(missionId)
       : emptyBoard()
 
     if (context.messages.length === 0) {
-      const speak = `¡Hola! Vamos a estudiar "${mission.title}"${
-        mission.uses_board ? ' (puedes usar la pizarra)' : ''
-      }. Empezamos por lo básico y luego te haré preguntas para fijarte bien en los detalles. Cuéntame qué sabes o qué te confunde.`
+      const speak = mission.uses_board
+        ? `¡Hola! Vamos a estudiar "${mission.title}" (puedes usar la pizarra). Empezamos por lo básico y luego te haré preguntas para fijarte bien en los detalles. Cuéntame qué sabes o qué te confunde.`
+        : `¡Hola! Antes de las preguntas, quiero conocer tu tema "${mission.title}". Cuéntame lo que dice tu cuaderno: puedes escribirlo o usar “Hablar del tema” varias veces, revisar las palabras y sumarlas abajo. Cuando esté listo, envíamelo.`
       context.topic_summary = mission.title
       context.context_summary = `Inicio local. Misión: "${mission.title}".`
       try {
@@ -1265,6 +1297,15 @@ router.post(
     )
     context.messages.push(userMsg)
     const userTurns = context.messages.filter((m) => m.role === 'user').length
+    if (!mission.uses_board && !context.notebook_context.trim() && userTurns === 1) {
+      context.notebook_context = truncateChars(message, MAX_NOTEBOOK)
+      await pool.query(
+        `UPDATE study_mission_sessions SET notebook_context = ? WHERE mission_id = ?`,
+        [context.notebook_context, missionId],
+      )
+    } else {
+      await ensureNotebookContext(missionId, mission.uses_board, context)
+    }
 
     const lastTutorMsg = [...context.messages]
       .reverse()
@@ -1281,7 +1322,7 @@ router.post(
 
     let instruction = allowAiDraw
       ? 'Responde breve. Conserva ejercicio activo. Anota "Solo bien: N/2". Evalúa study_eval: 2 problemas resueltos solo; al llegar a 2 pregunta si quiere otro tipo de ejercicio (passed=false); passed=true solo si declina. Incluye draw_ops con clear_board + stamps/shapes (no dejes el ejercicio solo en texto).'
-      : 'Responde breve. Enseña el tema completo (básico + observación). Conserva ejercicio activo. Anota "Errores: N". Piso user_turns ≥ 10+N. Pregunta todo lo posible del tema. Al cumplir el piso pregunta si queda más contenido (passed=false); passed=true solo si declina. Sin pizarra.'
+      : 'Responde breve. Enseña el tema completo (básico + observación) SOLO con notebook_context + título/descripción. Conserva ejercicio activo. Anota "Errores: N". Piso user_turns ≥ 10+N. Pregunta todo lo posible de ese relato. Al cumplir el piso pregunta si queda más contenido (passed=false); passed=true solo si declina. Sin pizarra.'
     if (fromVoice) {
       instruction +=
         ' El mensaje viene de voz (transcrito): prioriza afinar topic_summary y context_summary con lo que explicó el niño.'
@@ -1301,6 +1342,14 @@ router.post(
       phase: context.tutor_phase,
       topic_summary: truncateChars(context.topic_summary, 120),
       context_summary: truncateChars(context.context_summary, 400),
+      ...(mission.uses_board
+        ? {}
+        : {
+            notebook_context: truncateChars(
+              context.notebook_context,
+              MAX_NOTEBOOK,
+            ),
+          }),
       last_tutor_message: lastTutor,
       hints_level: context.hints_level,
       ...(allowAiDraw ? { allow_ai_draw: true } : {}),
@@ -1308,7 +1357,14 @@ router.post(
       ...(boardHas
         ? { board_drawing: truncateChars(boardDescription ?? '', 500) }
         : {}),
-      child_message: truncateChars(message, fromVoice ? 4000 : 800),
+      child_message: truncateChars(
+        message,
+        !mission.uses_board && userTurns === 1
+          ? MAX_NOTEBOOK
+          : fromVoice
+            ? 4000
+            : 800,
+      ),
     })
 
     const raw = await callGemini({
