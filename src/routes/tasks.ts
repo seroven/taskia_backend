@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import type { ResultSetHeader, RowDataPacket } from 'mysql2'
+import type { ResultSetHeader, RowDataPacket } from '../db/pool.js'
 import { pool } from '../db/pool.js'
 import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
@@ -7,7 +7,6 @@ import {
   AppError,
   formatMysqlDate,
   formatMysqlDateTime,
-  localDayUtcRange,
   todayISO,
 } from '../utils/helpers.js'
 
@@ -132,9 +131,8 @@ router.get(
       if (!/^\d{4}-\d{2}-\d{2}$/.test(createdOn)) {
         throw new AppError('Fecha inválida en created_on. Usa YYYY-MM-DD')
       }
-      const { start, end } = localDayUtcRange(createdOn)
-      sql += ' AND t.created_at >= ? AND t.created_at < ?'
-      params.push(start, end)
+      sql += ' AND DATE(t.created_at) = ?'
+      params.push(createdOn)
     }
     if (dueOn) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dueOn)) {
@@ -199,7 +197,7 @@ router.post(
         description,
         kind,
         nextOrder,
-        usesBoard ? 1 : 0,
+        usesBoard,
         dueDate,
       ],
     )
@@ -275,8 +273,8 @@ router.patch(
         dueDate,
         status,
         boardOrder,
-        nextUsesBoard ? 1 : 0,
-        nextModeChosen ? 1 : 0,
+        nextUsesBoard,
+        nextModeChosen,
         taskId,
         userId,
       ],

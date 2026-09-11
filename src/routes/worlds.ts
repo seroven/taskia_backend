@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import type { ResultSetHeader, RowDataPacket } from 'mysql2'
+import type { ResultSetHeader, RowDataPacket } from '../db/pool.js'
 import { pool } from '../db/pool.js'
 import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
@@ -165,7 +165,7 @@ async function ensureMissionSession(missionId: number) {
     `INSERT INTO study_mission_sessions
        (mission_id, tutor_phase, topic_summary, context_summary, notebook_context, hints_level)
      VALUES (?, 'understanding', '', '', '', 0)
-     ON DUPLICATE KEY UPDATE mission_id = mission_id`,
+     ON CONFLICT (mission_id) DO NOTHING`,
     [missionId],
   )
 }
@@ -226,7 +226,7 @@ async function saveMissionBoardDb(missionId: number, board: unknown) {
   await pool.query(
     `INSERT INTO study_mission_boards (mission_id, board_json)
      VALUES (?, ?)
-     ON DUPLICATE KEY UPDATE board_json = VALUES(board_json)`,
+     ON CONFLICT (mission_id) DO UPDATE SET board_json = EXCLUDED.board_json`,
     [missionId, raw],
   )
 }
@@ -238,7 +238,11 @@ async function loadMissionBoard(missionId: number) {
   )
   if (rows[0]?.board_json) {
     try {
-      return coerceBoard(JSON.parse(rows[0].board_json as string))
+      return coerceBoard(
+        typeof rows[0].board_json === 'string'
+          ? JSON.parse(rows[0].board_json)
+          : rows[0].board_json,
+      )
     } catch {
       /* fall through */
     }
@@ -259,7 +263,7 @@ async function insertMissionMessage(
     const [result] = await pool.query<ResultSetHeader>(
       `INSERT INTO study_mission_messages (mission_id, role, content, from_voice)
        VALUES (?, ?, ?, ?)`,
-      [missionId, role, content, fromVoice ? 1 : 0],
+      [missionId, role, content, fromVoice],
     )
     insertId = result.insertId
   } catch {
@@ -931,7 +935,7 @@ function estimateMaxQuestionsFromMaterial(
   return Math.max(1, Math.min(requested, estimated))
 }
 
-/** mysql2 puede devolver JSON ya parseado; Gemini a veces manda shapes raros. */
+/** jsonb puede llegar ya parseado; Gemini a veces manda shapes raros. */
 function normalizeOptionsList(raw: unknown): string[] | null {
   if (raw == null) return null
 
@@ -1209,7 +1213,7 @@ router.patch(
       `UPDATE study_missions
        SET title = ?, description = ?, uses_board = ?
        WHERE id = ?`,
-      [title, description, usesBoard ? 1 : 0, current.id],
+      [title, description, usesBoard, current.id],
     )
     res.json(await fetchMission(missionId, userId))
   }),
@@ -1689,7 +1693,7 @@ router.post(
           prompt,
           optionsJson,
           answerKey,
-          requiresBoard ? 1 : 0,
+          requiresBoard,
           promptDrawOps,
         ],
       )
@@ -1877,7 +1881,7 @@ router.post(
       await pool.query(
         `INSERT INTO study_challenge_answers (question_id, user_answer, board_json, is_correct)
          VALUES (?, ?, ?, ?)`,
-        [qid, submitted.user_answer, boardRaw, isCorrect ? 1 : 0],
+        [qid, submitted.user_answer, boardRaw, isCorrect],
       )
     }
 
@@ -2002,7 +2006,7 @@ router.post(
     await pool.query(
       `INSERT INTO study_world_courses (world_id, course_id, sort_order)
        VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE sort_order = sort_order`,
+       ON CONFLICT (world_id, course_id) DO NOTHING`,
       [worldId, courseId, maxOrder + 1],
     )
     res.json(await listWorldCourses(worldId))
@@ -2069,7 +2073,7 @@ router.post(
       `INSERT INTO study_missions
          (world_id, course_id, title, description, status, uses_board, sort_order)
        VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
-      [worldId, courseId, title, description, usesBoard ? 1 : 0, maxOrder + 1],
+      [worldId, courseId, title, description, usesBoard, maxOrder + 1],
     )
     res.json(await fetchMission(result.insertId, userId))
   }),
@@ -2153,7 +2157,7 @@ router.post(
           courseId,
           source.title,
           source.description,
-          source.uses_board ? 1 : 0,
+          source.uses_board,
           source.id,
           maxOrder,
         ],

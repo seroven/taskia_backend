@@ -62,9 +62,8 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
         username: string
         email: string
         role: UserRole
-        is_active: number
-      }> &
-        import('mysql2').RowDataPacket[]
+        is_active: number | boolean
+      }>
     >(
       'SELECT id, username, email, role, is_active FROM users WHERE id = ? LIMIT 1',
       [payload.sub],

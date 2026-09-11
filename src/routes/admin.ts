@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import type { ResultSetHeader, RowDataPacket } from 'mysql2'
+import type { ResultSetHeader, RowDataPacket } from '../db/pool.js'
 import { pool } from '../db/pool.js'
 import { requireAuth, requireAdmin } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
@@ -1002,7 +1002,7 @@ router.post(
     const passwordHash = await bcrypt.hash(password, 10)
     const [result] = await pool.query<ResultSetHeader>(
       `INSERT INTO users (username, email, password_hash, role, is_active)
-       VALUES (?, ?, ?, 'user', 1)`,
+       VALUES (?, ?, ?, 'user', TRUE)`,
       [u, e, passwordHash],
     )
     res.json(await requireStudent(result.insertId))
@@ -1052,13 +1052,13 @@ router.patch(
       await pool.query(
         `UPDATE users SET username = ?, email = ?, is_active = ?, password_hash = ?
          WHERE id = ? AND role = 'user'`,
-        [u, e, isActive ? 1 : 0, passwordHash, studentId],
+        [u, e, isActive, passwordHash, studentId],
       )
     } else {
       await pool.query(
         `UPDATE users SET username = ?, email = ?, is_active = ?
          WHERE id = ? AND role = 'user'`,
-        [u, e, isActive ? 1 : 0, studentId],
+        [u, e, isActive, studentId],
       )
     }
 
@@ -1102,7 +1102,7 @@ router.post(
     }
 
     const [result] = await pool.query<ResultSetHeader>(
-      'INSERT INTO courses (user_id, name, is_active) VALUES (?, ?, 1)',
+      'INSERT INTO courses (user_id, name, is_active) VALUES (?, ?, TRUE)',
       [studentId, name],
     )
     res.json(await requireStudentCourse(studentId, result.insertId))
@@ -1165,7 +1165,7 @@ router.post(
         continue
       }
       const [result] = await pool.query<ResultSetHeader>(
-        'INSERT INTO courses (user_id, name, is_active) VALUES (?, ?, 1)',
+        'INSERT INTO courses (user_id, name, is_active) VALUES (?, ?, TRUE)',
         [studentId, name],
       )
       created.push(await requireStudentCourse(studentId, result.insertId))
@@ -1197,7 +1197,7 @@ router.patch(
 
     await pool.query(
       'UPDATE courses SET name = ?, is_active = ? WHERE id = ? AND user_id = ?',
-      [name, isActive ? 1 : 0, courseId, studentId],
+      [name, isActive, courseId, studentId],
     )
     res.json(await requireStudentCourse(studentId, courseId))
   }),

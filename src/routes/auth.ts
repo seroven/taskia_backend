@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import type { RowDataPacket } from 'mysql2'
+import type { RowDataPacket } from '../db/pool.js'
 import { pool } from '../db/pool.js'
 import {
   clearAuthCookie,

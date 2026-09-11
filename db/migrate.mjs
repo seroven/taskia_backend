@@ -1,16 +1,20 @@
 /**
- * Taskia DB setup / migrations (MySQL).
+ * Taskia DB setup (PostgreSQL).
  *
- *   npm run db:setup     → aplica schema.sql (instalación / sync idempotente)
- *   npm run db:migrate   → aplica migraciones pendientes en db/migrations/
+ *   npm run db:setup     → CREATE SCHEMA + aplica schema.pg.sql
+ *   npm run db:migrate   → si no hay tablas, aplica schema.pg.sql; si ya está, no-op
  *
- * Env: usa MYSQL_* del --env-file del script npm (.env.development por defecto).
+ * El schema de aplicación es PG_SCHEMA (por defecto "taskia"), no public.
+ * Las migraciones históricas de MySQL en db/migrations/ no se aplican aquí:
+ * el esquema vivo está en schema.pg.sql.
+ *
+ * Env: PG_* / PG_DSN del --env-file del script npm (.env.development por defecto).
  * Override: TASKIA_ENV=qa|pd|production o --env=pd
  */
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import mysql from 'mysql2/promise'
+import pg from 'pg'
 import dotenv from 'dotenv'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -38,143 +42,186 @@ if (fs.existsSync(envPath)) {
   process.exit(1)
 }
 
-const {
-  MYSQL_HOST = 'localhost',
-  MYSQL_PORT = '3306',
-  MYSQL_USER,
-  MYSQL_PASSWORD,
-  MYSQL_DATABASE = 'taskia',
-} = process.env
+const pgDsn = (process.env.PG_DSN ?? process.env.DATABASE_URL ?? '').trim()
+const pgSchema = (process.env.PG_SCHEMA ?? 'taskia').trim() || 'taskia'
+const sslmode = (
+  process.env.PG_SSLMODE ?? (pgDsn ? 'require' : 'prefer')
+).toLowerCase()
 
-if (!MYSQL_USER) {
-  console.error('Falta MYSQL_USER en el env')
+if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(pgSchema)) {
+  console.error('PG_SCHEMA inválido')
   process.exit(1)
 }
 
-const migrationsDir = path.join(__dirname, 'migrations')
-const schemaPath = path.join(__dirname, 'schema.sql')
-
-function listMigrationFiles() {
-  if (!fs.existsSync(migrationsDir)) return []
-  return fs
-    .readdirSync(migrationsDir)
-    .filter((f) => /^\d+_.+\.sql$/i.test(f))
-    .sort()
+function quoteIdent(name) {
+  return `"${name}"`
 }
 
-async function tableExists(conn, table) {
-  const [rows] = await conn.query(
-    `SELECT 1 AS ok
-     FROM information_schema.TABLES
-     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-     LIMIT 1`,
-    [MYSQL_DATABASE, table],
-  )
-  return rows.length > 0
+function sslConfig() {
+  if (sslmode === 'require' || sslmode === 'verify-full') {
+    return { rejectUnauthorized: sslmode === 'verify-full' }
+  }
+  return undefined
 }
 
-async function ensureMigrationsTable(conn) {
-  await conn.query(`
+function clientConfig() {
+  const ssl = sslConfig()
+  if (pgDsn) return { connectionString: pgDsn, ssl }
+  return {
+    host: process.env.PG_HOST ?? 'localhost',
+    port: Number(process.env.PG_PORT ?? 5432),
+    user: process.env.PG_USER ?? 'postgres',
+    password: process.env.PG_PASSWORD ?? '',
+    database: process.env.PG_DATABASE ?? 'postgres',
+    ssl,
+  }
+}
+
+const schemaPath = path.join(__dirname, 'schema.pg.sql')
+
+function splitPgStatements(sql) {
+  const out = []
+  let i = 0
+  let buf = ''
+  const n = sql.length
+  while (i < n) {
+    const c = sql[i]
+    if (c === '-' && sql[i + 1] === '-') {
+      const nl = sql.indexOf('\n', i)
+      i = nl === -1 ? n : nl + 1
+      continue
+    }
+    if (c === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      i = end === -1 ? n : end + 2
+      continue
+    }
+    if (c === "'") {
+      buf += c
+      i += 1
+      while (i < n) {
+        buf += sql[i]
+        if (sql[i] === "'" && sql[i + 1] === "'") {
+          buf += sql[i + 1]
+          i += 2
+          continue
+        }
+        if (sql[i] === "'") {
+          i += 1
+          break
+        }
+        i += 1
+      }
+      continue
+    }
+    if (c === '$' && sql[i + 1] === '$') {
+      const end = sql.indexOf('$$', i + 2)
+      if (end === -1) {
+        buf += sql.slice(i)
+        break
+      }
+      buf += sql.slice(i, end + 2)
+      i = end + 2
+      continue
+    }
+    if (c === ';') {
+      const stmt = buf.trim()
+      if (stmt) out.push(stmt)
+      buf = ''
+      i += 1
+      continue
+    }
+    buf += c
+    i += 1
+  }
+  const last = buf.trim()
+  if (last) out.push(last)
+  return out
+}
+
+async function applySchema(client) {
+  const sql = fs.readFileSync(schemaPath, 'utf8')
+  console.log('→ schema.pg.sql')
+  for (const stmt of splitPgStatements(sql)) {
+    await client.query(stmt)
+  }
+}
+
+async function ensureMigrationsTable(client) {
+  await client.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
-      id VARCHAR(255) NOT NULL,
-      applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      id VARCHAR(255) PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `)
 }
 
-async function appliedIds(conn) {
-  const [rows] = await conn.query(
-    'SELECT id FROM schema_migrations ORDER BY id',
+async function isApplied(client, id) {
+  const result = await client.query(
+    'SELECT 1 AS ok FROM schema_migrations WHERE id = $1 LIMIT 1',
+    [id],
   )
-  return new Set(rows.map((r) => r.id))
+  return result.rows.length > 0
 }
 
-async function markApplied(conn, id) {
-  await conn.query(
-    'INSERT INTO schema_migrations (id) VALUES (?) ON DUPLICATE KEY UPDATE id = id',
+async function markApplied(client, id) {
+  await client.query(
+    `INSERT INTO schema_migrations (id) VALUES ($1)
+     ON CONFLICT (id) DO NOTHING`,
     [id],
   )
 }
 
-async function runSqlFile(conn, filePath, label) {
-  const sql = fs.readFileSync(filePath, 'utf8')
-  console.log(`→ ${label}`)
-  await conn.query(sql)
-}
-
-async function applySchema(conn) {
-  await runSqlFile(conn, schemaPath, 'schema.sql')
-}
-
-async function baselineAll(conn, files) {
-  for (const f of files) {
-    await markApplied(conn, f)
-  }
-  console.log(`Baseline: ${files.length} migración(es) marcadas como aplicadas`)
+async function tableExists(client, table) {
+  const result = await client.query(
+    `SELECT 1 AS ok
+     FROM information_schema.tables
+     WHERE table_schema = $1 AND table_name = $2
+     LIMIT 1`,
+    [pgSchema, table],
+  )
+  return result.rows.length > 0
 }
 
 async function main() {
-  const connection = await mysql.createConnection({
-    host: MYSQL_HOST,
-    port: Number(MYSQL_PORT),
-    user: MYSQL_USER,
-    password: MYSQL_PASSWORD,
-    multipleStatements: true,
-  })
+  const client = new pg.Client(clientConfig())
+  await client.connect()
 
   try {
-    console.log(`Env: ${envFile} | DB: ${MYSQL_DATABASE} @ ${MYSQL_HOST}`)
+    const host = pgDsn ? '(PG_DSN)' : (process.env.PG_HOST ?? 'localhost')
+    const database = process.env.PG_DATABASE ?? 'postgres'
+    console.log(
+      `Env: ${envFile} | DB: ${database} @ ${host} | schema: ${pgSchema}`,
+    )
 
-    if (setupOnly) {
-      await applySchema(connection)
-      await connection.query(`USE \`${MYSQL_DATABASE}\``)
-      await ensureMigrationsTable(connection)
-      await baselineAll(connection, listMigrationFiles())
+    await client.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(pgSchema)}`)
+    await client.query(`SET search_path TO ${quoteIdent(pgSchema)}, public`)
+    await ensureMigrationsTable(client)
+
+    const schemaId = 'schema.pg.sql'
+    const hasUsers = await tableExists(client, 'users')
+    const already = await isApplied(client, schemaId)
+
+    if (setupOnly || !hasUsers || !already) {
+      await applySchema(client)
+      await markApplied(client, schemaId)
     } else {
-      await connection.query(`CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`
-        CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`)
-      await connection.query(`USE \`${MYSQL_DATABASE}\``)
-      await ensureMigrationsTable(connection)
-
-      const files = listMigrationFiles()
-      const done = await appliedIds(connection)
-      const hasUsers = await tableExists(connection, 'users')
-      const hasWorlds = await tableExists(connection, 'study_worlds')
-
-      // DB vacía → schema completo + baseline de migraciones históricas
-      if (!hasUsers) {
-        await applySchema(connection)
-        await connection.query(`USE \`${MYSQL_DATABASE}\``)
-        await baselineAll(connection, files)
-      } else if (done.size === 0 && hasWorlds) {
-        // DB ya al día (p. ej. desde desktop) → solo registrar baseline
-        await baselineAll(connection, files)
-      } else {
-        const pending = files.filter((f) => !done.has(f))
-        if (pending.length === 0) {
-          console.log('Nada pendiente')
-        } else {
-          for (const f of pending) {
-            await runSqlFile(connection, path.join(migrationsDir, f), f)
-            await markApplied(connection, f)
-          }
-          console.log(`Aplicadas: ${pending.length}`)
-        }
-      }
+      console.log('Nada pendiente')
     }
 
-    await connection.query(`USE \`${MYSQL_DATABASE}\``)
-    const [tables] = await connection.query(
-      `SELECT TABLE_NAME AS name
-       FROM information_schema.TABLES
-       WHERE TABLE_SCHEMA = ?
-       ORDER BY TABLE_NAME`,
-      [MYSQL_DATABASE],
+    const tables = await client.query(
+      `SELECT table_name AS name
+       FROM information_schema.tables
+       WHERE table_schema = $1
+       ORDER BY table_name`,
+      [pgSchema],
     )
-    console.log('OK — tablas:', tables.map((t) => t.name).join(', '))
+    console.log(
+      'OK — tablas:',
+      tables.rows.map((t) => t.name).join(', '),
+    )
   } finally {
-    await connection.end()
+    await client.end()
   }
 }
 

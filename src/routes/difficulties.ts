@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import type { RowDataPacket } from 'mysql2'
+import type { RowDataPacket } from '../db/pool.js'
 import { pool } from '../db/pool.js'
 import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'

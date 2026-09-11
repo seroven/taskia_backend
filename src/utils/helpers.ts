@@ -30,17 +30,6 @@ export function todayISO(): string {
   return `${y}-${m}-${d}`
 }
 
-/** Inicio (incl.) y fin (excl.) del día civil local, en UTC ISO para MySQL. */
-export function localDayUtcRange(dateStr: string): { start: string; end: string } {
-  const [y, m, d] = dateStr.split('-').map(Number)
-  const startLocal = new Date(y, m - 1, d, 0, 0, 0, 0)
-  const endLocal = new Date(y, m - 1, d + 1, 0, 0, 0, 0)
-  return {
-    start: startLocal.toISOString().slice(0, 19).replace('T', ' '),
-    end: endLocal.toISOString().slice(0, 19).replace('T', ' '),
-  }
-}
-
 export function formatMysqlDateTime(value: Date | string | null): string | null {
   if (value == null) return null
   if (typeof value === 'string') {

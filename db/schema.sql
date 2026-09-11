@@ -1,4 +1,4 @@
--- Taskia schema
+-- Taskia schema (MySQL histórico). El backend usa PostgreSQL: schema.pg.sql.
 -- MySQL 8+
 --
 -- Si tu cliente SQL falla con error 1064 cerca del 2.º CREATE:

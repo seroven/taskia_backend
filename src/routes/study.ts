@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import type { ResultSetHeader, RowDataPacket } from 'mysql2'
+import type { ResultSetHeader, RowDataPacket } from '../db/pool.js'
 import { pool } from '../db/pool.js'
 import { requireAuth, requireStudent } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/error.js'
@@ -133,7 +133,7 @@ async function ensureSession(taskId: number) {
   await pool.query(
     `INSERT INTO study_sessions (task_id, tutor_phase, topic_summary, context_summary, hints_level)
      VALUES (?, 'understanding', '', '', 0)
-     ON DUPLICATE KEY UPDATE task_id = task_id`,
+     ON CONFLICT (task_id) DO NOTHING`,
     [taskId],
   )
 }
@@ -173,7 +173,9 @@ async function loadBoard(taskId: number) {
   )
   if (rows[0]?.board_json) {
     try {
-      return coerceBoard(JSON.parse(rows[0].board_json as string))
+      const raw = rows[0].board_json
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+      return coerceBoard(parsed)
     } catch {
       /* fallthrough */
     }
@@ -186,7 +188,7 @@ async function loadBoard(taskId: number) {
 async function saveBoard(taskId: number, board: unknown) {
   await pool.query(
     `INSERT INTO study_boards (task_id, board_json) VALUES (?, ?)
-     ON DUPLICATE KEY UPDATE board_json = VALUES(board_json)`,
+     ON CONFLICT (task_id) DO UPDATE SET board_json = EXCLUDED.board_json`,
     [taskId, JSON.stringify(board)],
   )
 }
@@ -202,7 +204,7 @@ async function insertMessage(
     const [result] = await pool.query<ResultSetHeader>(
       `INSERT INTO study_messages (task_id, role, content, from_voice)
        VALUES (?, ?, ?, ?)`,
-      [taskId, role, content, fromVoice ? 1 : 0],
+      [taskId, role, content, fromVoice],
     )
     insertId = result.insertId
   } catch {
@@ -234,7 +236,7 @@ async function loadUserMemory(userId: number) {
 async function saveUserMemory(userId: number, summary: string) {
   await pool.query(
     `INSERT INTO user_study_memory (user_id, memory_summary) VALUES (?, ?)
-     ON DUPLICATE KEY UPDATE memory_summary = VALUES(memory_summary)`,
+     ON CONFLICT (user_id) DO UPDATE SET memory_summary = EXCLUDED.memory_summary`,
     [userId, summary],
   )
 }
@@ -547,7 +549,7 @@ router.post(
     await saveSessionMeta(context)
     if (updateUserMemory) await saveUserMemory(userId, reply.user_memory_summary)
     if (reply.study_eval.passed) {
-      await pool.query('UPDATE tasks SET study_passed = 1 WHERE id = ? AND user_id = ?', [
+      await pool.query('UPDATE tasks SET study_passed = TRUE WHERE id = ? AND user_id = ?', [
         taskId,
         userId,
       ])

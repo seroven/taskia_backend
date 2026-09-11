@@ -6,16 +6,26 @@ function required(name: string, fallback?: string): string {
   return value
 }
 
+const pgDsn = (process.env.PG_DSN ?? process.env.DATABASE_URL ?? '').trim()
+const pgSchema = (process.env.PG_SCHEMA ?? 'taskia').trim() || 'taskia'
+
+if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(pgSchema)) {
+  throw new Error('PG_SCHEMA inválido')
+}
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? 'development',
   port: Number(process.env.PORT ?? 3001),
   corsOrigin: required('CORS_ORIGIN', 'http://localhost:5173'),
-  mysql: {
-    host: required('MYSQL_HOST', 'localhost'),
-    port: Number(process.env.MYSQL_PORT ?? 3306),
-    user: required('MYSQL_USER', 'root'),
-    password: process.env.MYSQL_PASSWORD ?? '',
-    database: required('MYSQL_DATABASE', 'taskia'),
+  pg: {
+    dsn: pgDsn,
+    host: process.env.PG_HOST ?? 'localhost',
+    port: Number(process.env.PG_PORT ?? 5432),
+    user: process.env.PG_USER ?? 'postgres',
+    password: process.env.PG_PASSWORD ?? '',
+    database: process.env.PG_DATABASE ?? 'postgres',
+    schema: pgSchema,
+    sslmode: (process.env.PG_SSLMODE ?? (pgDsn ? 'require' : 'prefer')).toLowerCase(),
   },
   jwt: {
     secret: required('JWT_SECRET', 'dev-secret'),

@@ -59,7 +59,7 @@ npm run dev           # tsx watch + .env.development  (puerto 3001)
 
 Plantillas: `.env.example`, `.env.example.qa`, `.env.example.pd`, `.env.example.production`.
 
-Variables principales: `PORT`, `CORS_ORIGIN`, `MYSQL_*`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `COOKIE_NAME`, `COOKIE_SECURE`, `COOKIE_SAME_SITE`, `GEMINI_API_KEY`, `GEMINI_MODEL`.
+Variables principales: `PORT`, `CORS_ORIGIN`, `PG_DSN` o `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DATABASE`, `PG_SCHEMA`, `PG_SSLMODE`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `COOKIE_NAME`, `COOKIE_SECURE`, `COOKIE_SAME_SITE`, `GEMINI_API_KEY`, `GEMINI_MODEL`.
 
 En un host tipo Render, configura esas variables en el panel. `npm start` no lee `.env.pd` del repo.
 
@@ -85,7 +85,7 @@ Montadas en `src/app.ts`:
 ## Carpetas
 
 ```
-db/              schema.sql, migrate.mjs, migrations/
+db/              schema.pg.sql, migrate.mjs, migrations/ (MySQL histórico)
 src/index.ts     Arranque
 src/app.ts       Express, CORS, rutas
 src/config/      Entorno
